@@ -1,0 +1,51 @@
+{
+  "name": "ci-wizard",
+  "version": "0.1.0",
+  "description": "Where your GitHub Actions time goes and what to fix first: measured from the Actions API, confirmed in your workflow files, savings labelled as estimates.",
+  "type": "module",
+  "bin": {
+    "ci-wizard": "bin/ci-wizard.mjs"
+  },
+  "exports": {
+    ".": "./dist/index.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/cli.mjs",
+    "dist/index.mjs",
+    "dist/THIRD_PARTY_LICENSES.txt",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/rules.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check-dist": "node build.mjs && git diff --exit-code -- dist/"
+  },
+  "keywords": [
+    "ci",
+    "github-actions",
+    "performance",
+    "devops",
+    "ci-optimization"
+  ],
+  "author": "askalf",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/askalf/ci-wizard.git"
+  },
+  "homepage": "https://github.com/askalf/ci-wizard",
+  "bugs": {
+    "url": "https://github.com/askalf/ci-wizard/issues"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "yaml": "2.9.1"
+  }
+}

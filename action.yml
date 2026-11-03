@@ -1,0 +1,35 @@
+name: CI wizard audit
+description: Where this repository's GitHub Actions time goes and what to fix first. Read-only; the report lands in the job summary.
+author: askalf
+branding:
+  icon: activity
+  color: green
+inputs:
+  token:
+    description: A token that can read the repository's Actions and contents (actions read, contents read). The job's own token is enough for the repository it runs in.
+    required: false
+    default: ${{ github.token }}
+  repository:
+    description: The repository to audit, as owner/name. Defaults to the one the workflow runs in.
+    required: false
+    default: ${{ github.repository }}
+  days:
+    description: How many days of runs to read (up to 500 runs are read).
+    required: false
+    default: '7'
+  workflows:
+    description: How many of the busiest workflows to sample job by job.
+    required: false
+    default: '8'
+  per-workflow:
+    description: How many recent successful runs of each sampled workflow to time step by step.
+    required: false
+    default: '5'
+outputs:
+  report-path:
+    description: Path of the markdown report on the runner.
+  findings:
+    description: How many findings the audit reported.
+runs:
+  using: node24
+  main: dist/action.mjs
