@@ -49,12 +49,13 @@ it cannot read the repository. Pin the action to a full commit SHA in your own w
 ### From the command line
 
 ```sh
-npx ci-wizard owner/repo
-npx ci-wizard owner/repo --days 14 --json > audit.json
-npx ci-wizard owner/repo --html audit.html
+npx github:askalf/ci-wizard owner/repo
+npx github:askalf/ci-wizard owner/repo --days 14 --json > audit.json
+npx github:askalf/ci-wizard owner/repo --html audit.html
 ```
 
-The token comes from `GITHUB_TOKEN` or `GH_TOKEN`, or from `gh auth token` when the GitHub CLI is
+This runs the committed bundle straight from this repository, with nothing to install; an npm
+package comes with a later release. The token comes from `GITHUB_TOKEN` or `GH_TOKEN`, or from `gh auth token` when the GitHub CLI is
 signed in. Options: `--days`, `--workflows`, `--per-workflow`, `--json`, `--html <file>`. Exit
 codes: 0 report written, 1 nothing to read or an API error, 2 usage, 3 stopped near the rate
 limit.
