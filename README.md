@@ -119,9 +119,46 @@ runs in the window, or an API error, 2 usage, 3 stopped near the rate limit.
 - A token with **actions: read** and **contents: read**. The job's own `GITHUB_TOKEN` is enough
   for the repository a workflow runs in; a fine-grained token with those two permissions works
   from the command line. A repository the token cannot see reads as not found.
-- The client stops before the token's rate limit runs out and says how many calls were left, so
-  an audit never spends the budget a team's own CI needs.
+- While GitHub reports the remaining count (api.github.com does), the client sends no request once
+  the token has 25 calls or fewer left, retries included, so an audit leaves at least 25 for the
+  repository's own CI, and it says how many were left. Without a remaining count the reserve
+  cannot be enforced, and the report says so.
+  When GitHub's answers carry the rate-limit
+  headers, as api.github.com's do, the report states the budget the audit drew on ("41 API calls,
+  959 of 1000 left this hour"); without them it leaves the line out. An audit that finds no runs
+  writes no report.
 - `compare` reads two saved reports and needs no token.
+
+### Rate limits: a GitHub App token for a larger budget
+
+A workflow's own `GITHUB_TOKEN` has 1,000 requests an hour per repository, shared with every other
+step that calls the API. A person's token has 5,000, shared with everything that person runs. A
+GitHub App's installation token has its own budget of 5,000 or more, and one App installed on
+several repositories can audit all of them. An audit of a busy repository takes about 50 calls,
+so the job token is enough for one audit a day; an App is worth it for frequent audits, several
+repositories, or a repository whose CI already spends its job token.
+
+Create a private GitHub App with **Actions: read** and **Contents: read**, install it on the
+repositories to audit, keep its client ID as a repository variable and its private key as a
+secret, and mint a token in the job:
+
+```yaml
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.CI_WIZARD_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_WIZARD_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-actions: read
+          permission-contents: read
+      - uses: askalf/ci-wizard@v0.1.2
+        with:
+          token: ${{ steps.app.outputs.token }}
+```
+
+The token lasts an hour and is revoked when the job ends. From the command line, any token with
+the same two permissions works through `GITHUB_TOKEN` or `GH_TOKEN`.
 
 ## Limitations
 

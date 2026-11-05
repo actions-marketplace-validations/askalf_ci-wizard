@@ -35,6 +35,20 @@ export function stepLabel(name) {
   return String(name).replace(/^(Run |Post Run )?([\w.-]+\/[\w./-]+)@\S+/, (_, run = '', action) => `${run}${action}`);
 }
 
+/**
+ * The API budget an audit drew on, as one clause: the calls made and what the token had left of its
+ * hourly limit, with the App route when the budget is a workflow token's 1,000 or less. Empty when
+ * GitHub sent no limit (an old report, or a fake client).
+ */
+export function budgetText(a) {
+  const r = a.rate_limit;
+  if (!r || !num(r.limit)) return '';
+  // Without a remaining count the limit is all that is known: it is never presented as what is left.
+  const left = num(r.remaining) ? `${r.remaining} of ${r.limit} left this hour` : `hourly limit ${r.limit}, remaining not reported`;
+  const app = r.limit <= 1000 ? "; a GitHub App's token has its own 5,000 or more" : '';
+  return `${num(a.api_calls) ? `${a.api_calls} API calls, ` : ''}${left}${app}`;
+}
+
 /** The opening paragraph: what to start with, and what the findings add up to against what was measured. */
 export function summary(a) {
   const L = [];
@@ -130,6 +144,15 @@ export function report(a, { maxFindings = 8 } = {}) {
     L.push('');
   }
   L.push('## How it was measured', '');
+  const budget = budgetText(a);
+  // The reserve is enforced against the remaining count GitHub reports; without one the client
+  // has nothing to hold it against, and the report says so instead of promising it.
+  if (budget) {
+    const known = num(a.rate_limit && a.rate_limit.remaining);
+    L.push(`- API budget: ${budget}. ${known
+      ? "An audit sends no request once the token has 25 calls or fewer left, so it always leaves at least 25 for the repository's own CI."
+      : 'GitHub reported no remaining count, so the 25-call reserve an audit normally keeps could not be enforced.'}`);
+  }
   L.push("- Job time = completed minus started; queue wait = started minus created; developer wait = a successful run's wall time. All from the Actions API, in whole seconds.");
   L.push('- Per-run figures are medians over the sampled successful runs of each workflow; queue and wait percentiles are over the sampled jobs and runs, so a p90 over a handful of them is close to the slowest one.');
   L.push('- Billed minutes round each GitHub-hosted job up to a whole minute, as GitHub bills it; a job counts as GitHub-hosted when its runner group is "GitHub Actions".');
