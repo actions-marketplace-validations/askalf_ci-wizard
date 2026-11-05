@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Self-hosted runners (the askalf/pitlane method, measured):
+
+- New rule **fork pull requests run on self-hosted runners**: each job's `if` and `runs-on` are
+  evaluated as GitHub would for a pull request from a fork (a small evaluator for the expression
+  language, `src/expr.mjs`), so a guard counts by what it does: a job that picks a self-hosted
+  runner for a fork is a risk, one whose `if` is false for it or whose `runs-on` sends it to a
+  GitHub-hosted runner is not. A value the audit cannot resolve (`vars`, `matrix`) makes it
+  possible, not confirmed. The example wraps the job's own runner selection unchanged.
+- New rule **self-hosted runners reused across jobs**: a runner id that took two or more sampled
+  jobs is a persistent runner, whose workspace and state carry between jobs. An ephemeral row that
+  keeps its name but registers anew each job is not reuse.
+- Both carry a `risk` unit: they rank before every saving, lead the report under "Start with", and
+  the summary counts them as risks to fix before any saving.
+
 API budget:
 
 - When GitHub sends its `x-ratelimit-limit` header, the report states the budget the audit drew on: the calls

@@ -39,6 +39,11 @@ minutes are that rounded figure for GitHub-hosted jobs (a job whose runner group
 Actions"); self-hosted jobs count 0. They sit beside job-minutes in the table, in `compare`, and
 in the short-hosted-jobs rule.
 
+**Risks first.** Two rules report a security and stability risk rather than a saving (unit
+`risk`): they rank before every saving and lead the report. They measure the method askalf/pitlane
+documents for self-hosted runners: a fork's pull request never reaches a self-hosted runner, and
+no two jobs share a runner.
+
 **Noise floor.** A finding whose estimated saving is under 1 minute a week is left out. Queue
 wait and matrix size save developer wait, not minutes, and always stay; the report says so.
 
@@ -199,6 +204,55 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 - **Fix** fewer, longer jobs: merge the short jobs of a run into one, run the workflow less often,
   or move it to a self-hosted runner. *Trade-off:* a merged job reports one status where there
   were several; a self-hosted runner is yours to run, patch and secure.
+
+## fork pull requests run on self-hosted runners
+
+- **Fires when** a sampled workflow on `pull_request` has a job that, evaluated as GitHub would for
+  a pull request from a fork, runs (its `if` is not false) and picks a self-hosted runner (its
+  `runs-on` comes to a label list, string or label object naming `self-hosted`). The `if` and
+  `runs-on` expressions are evaluated (`src/expr.mjs`) against what every pull request from a fork
+  shares (the event, the base repository, a head repository that is a fork and is not the base);
+  the action, branches, author, draft state and the fork's own name vary and stay unknown. Status
+  functions are known only for a job without `needs` (`success()` true, `failure()` false);
+  comparisons of different types coerce to numbers as GitHub's do; a label object's labels are
+  evaluated too. So a guard counts by what it does, not by what it mentions: `head.repo.full_name != github.repository
+  && 'ubuntu-latest' || …` is safe, the same with its branches reversed is not, `if:
+  github.event.pull_request.head.repo.fork` runs the job for forks, and a job behind `if:
+  github.event_name == 'push'` or `if: false` never runs for one. A `github.repository` check is no
+  guard: a fork's pull_request run happens in the base repository. On `pull_request_target` a job
+  counts only when a checkout step whose own `if` lets it run for a fork fetches the fork's code,
+  judged from its `ref` and `repository` together: a commit is the same code from any repository
+  (the head commit is the fork's, the base commit is not), and a branch name (the head's, the
+  base's, a literal, or the default branch) is whatever that branch holds in the repository it is
+  fetched from, so the fork's code from the fork. A string built around a value the audit cannot
+  know (the fork owner's login) is unknown.
+- **Confidence** confirmed on a public repository when the evaluation resolves; inferred when a
+  value the audit cannot know (a `vars`, `matrix` or `inputs` value) decides it, or when the
+  visibility could not be read. Not reported on a private or internal repository. GitHub's approval
+  of fork workflows (by default only a first-time contributor's) is a second line the audit cannot
+  read, not the guard.
+- **Estimate** none: a risk, ranked first.
+- **Fix** send a fork's pull requests to a GitHub-hosted runner and keep the job's own runner
+  selection for everything else. The guard requires a pull request first (`github.event.pull_request
+  && …`), so push, schedule and dispatch runs keep their own runners. The example wraps the job's
+  `runs-on` unchanged (a whole
+  expression in parentheses, a static label or list through `fromJSON`); a list with expressions
+  inside or a runner group cannot be carried over unchanged, so then there is no example.
+  *Trade-off:* a fork's checks then start slower, or are billed on a private repository, and a
+  job that needs the self-hosted machine must skip for forks.
+
+## self-hosted runners reused across jobs
+
+- **Fires when** one self-hosted runner registration (one runner id) took two or more of the sampled
+  jobs. An ephemeral, just-in-time runner registers anew for every job, so its id never repeats,
+  even when its name does; a repeated id is a persistent runner.
+- **Confidence** measured. One finding for the repository, listing the workflows.
+- **Estimate** none: a risk, ranked first. A job on a persistent runner can find the workspace,
+  files, processes and tool cache the job before it left.
+- **Fix** ephemeral runners: one job per registration (just-in-time configuration, or
+  `config.sh --ephemeral`), each from a clean directory, with a warm runner waiting so the start
+  stays fast. *Trade-off:* every job re-registers, and nothing a job leaves on disk survives for
+  the next, so caches go through `actions/cache` or a read-only tool cache.
 
 ## reruns
 

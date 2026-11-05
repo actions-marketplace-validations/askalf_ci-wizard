@@ -2379,14 +2379,14 @@ var require_bool = __commonJS({
 var require_stringifyNumber = __commonJS({
   "node_modules/yaml/dist/stringify/stringifyNumber.js"(exports) {
     "use strict";
-    function stringifyNumber({ format, minFractionDigits, tag, value }) {
+    function stringifyNumber({ format: format2, minFractionDigits, tag, value }) {
       if (typeof value === "bigint")
         return String(value);
       const num2 = typeof value === "number" ? value : Number(value);
       if (!isFinite(num2))
         return isNaN(num2) ? ".nan" : num2 < 0 ? "-.inf" : ".inf";
       let n = Object.is(value, -0) ? "-0" : JSON.stringify(value);
-      if (!format && minFractionDigits && (!tag || tag === "tag:yaml.org,2002:float") && /^-?\d/.test(n) && !n.includes("e")) {
+      if (!format2 && minFractionDigits && (!tag || tag === "tag:yaml.org,2002:float") && /^-?\d/.test(n) && !n.includes("e")) {
         let i = n.indexOf(".");
         if (i < 0) {
           i = n.length;
@@ -7546,6 +7546,381 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, workflows = 8,
 
 // src/workflow.mjs
 var import_yaml = __toESM(require_dist(), 1);
+
+// src/expr.mjs
+var UNKNOWN = /* @__PURE__ */ Symbol("unknown");
+var COMPLETE = /* @__PURE__ */ Symbol("complete");
+function opaque(differsFrom = [], tag = null) {
+  return { [OPAQUE]: true, differsFrom: differsFrom.map((v) => String(v).toLowerCase()), tag };
+}
+function opaqueTag(v) {
+  return isOpaque(v) ? v.tag : null;
+}
+var OPAQUE = /* @__PURE__ */ Symbol("opaque");
+var STATUS = /* @__PURE__ */ Symbol("status");
+var isOpaque = (v) => Boolean(v && typeof v === "object" && v[OPAQUE]);
+function tokenize(src) {
+  const tokens = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      let s = "";
+      for (; ; ) {
+        if (j >= src.length) throw new Error("unterminated string");
+        if (src[j] === "'") {
+          if (src[j + 1] === "'") {
+            s += "'";
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        s += src[j++];
+      }
+      tokens.push({ t: "lit", v: s });
+      i = j + 1;
+      continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (["==", "!=", "<=", ">=", "&&", "||"].includes(two)) {
+      tokens.push({ t: "op", v: two });
+      i += 2;
+      continue;
+    }
+    if ("!<>()[].,".includes(c)) {
+      tokens.push({ t: "op", v: c });
+      i++;
+      continue;
+    }
+    const num2 = /^-?(0x[0-9a-f]+|\d+(\.\d+)?(e[+-]?\d+)?)/i.exec(src.slice(i));
+    if (num2 && (c === "-" || /\d/.test(c))) {
+      tokens.push({ t: "lit", v: Number(num2[0]) });
+      i += num2[0].length;
+      continue;
+    }
+    const id = /^[A-Za-z_][A-Za-z0-9_-]*/.exec(src.slice(i));
+    if (id) {
+      const w = id[0];
+      if (w === "true" || w === "false") tokens.push({ t: "lit", v: w === "true" });
+      else if (w === "null") tokens.push({ t: "lit", v: null });
+      else tokens.push({ t: "id", v: w });
+      i += w.length;
+      continue;
+    }
+    if (c === "*") {
+      tokens.push({ t: "op", v: "*" });
+      i++;
+      continue;
+    }
+    throw new Error(`unexpected ${c}`);
+  }
+  return tokens;
+}
+function parseExpr(src) {
+  const tokens = tokenize(src);
+  let p = 0;
+  const peek = (v) => tokens[p] && tokens[p].t === "op" && tokens[p].v === v;
+  const eat = (v) => {
+    if (!peek(v)) throw new Error(`expected ${v}`);
+    p++;
+  };
+  function or() {
+    let left = and();
+    while (peek("||")) {
+      p++;
+      left = { k: "||", a: left, b: and() };
+    }
+    return left;
+  }
+  function and() {
+    let left = cmp();
+    while (peek("&&")) {
+      p++;
+      left = { k: "&&", a: left, b: cmp() };
+    }
+    return left;
+  }
+  function cmp() {
+    const left = unary();
+    for (const op of ["==", "!=", "<=", ">=", "<", ">"]) {
+      if (peek(op)) {
+        p++;
+        return { k: op, a: left, b: unary() };
+      }
+    }
+    return left;
+  }
+  function unary() {
+    if (peek("!")) {
+      p++;
+      return { k: "!", a: unary() };
+    }
+    return postfix(primary());
+  }
+  function primary() {
+    const tok = tokens[p++];
+    if (!tok) throw new Error("unexpected end");
+    if (tok.t === "lit") return { k: "lit", v: tok.v };
+    if (tok.t === "op" && tok.v === "(") {
+      const e = or();
+      eat(")");
+      return e;
+    }
+    if (tok.t === "id") {
+      if (peek("(")) {
+        p++;
+        const args = [];
+        if (!peek(")")) {
+          args.push(or());
+          while (peek(",")) {
+            p++;
+            args.push(or());
+          }
+        }
+        eat(")");
+        return { k: "call", name: tok.v.toLowerCase(), args };
+      }
+      return { k: "ctx", path: [tok.v] };
+    }
+    throw new Error(`unexpected ${tok.v}`);
+  }
+  function postfix(node) {
+    for (; ; ) {
+      if (peek(".")) {
+        p++;
+        const tok = tokens[p++];
+        if (!tok || tok.t !== "id" && !(tok.t === "op" && tok.v === "*")) throw new Error("expected a property");
+        node = { k: "prop", of: node, key: tok.v };
+      } else if (peek("[")) {
+        p++;
+        const key = or();
+        eat("]");
+        node = { k: "index", of: node, key };
+      } else return node;
+    }
+  }
+  const tree = or();
+  if (p !== tokens.length) throw new Error("trailing input");
+  return tree;
+}
+var truthy = (v) => v !== UNKNOWN && (isOpaque(v) || !(v === false || v === null || v === 0 || v === "" || Number.isNaN(v)));
+var falsy = (v) => v !== UNKNOWN && !truthy(v);
+var get = (obj, key) => {
+  if (obj === UNKNOWN || isOpaque(obj)) return UNKNOWN;
+  if (obj === null || typeof obj !== "object") return null;
+  const hit = Object.keys(obj).find((k) => k.toLowerCase() === String(key).toLowerCase());
+  if (hit !== void 0) return obj[hit];
+  return obj[COMPLETE] ? null : UNKNOWN;
+};
+function format(template, values) {
+  let out = "";
+  for (let i = 0; i < template.length; i++) {
+    const c = template[i];
+    if (c === "{" && template[i + 1] === "{") {
+      out += "{";
+      i++;
+      continue;
+    }
+    if (c === "}" && template[i + 1] === "}") {
+      out += "}";
+      i++;
+      continue;
+    }
+    if (c === "{") {
+      const m = /^\{(\d+)\}/.exec(template.slice(i));
+      if (!m || Number(m[1]) >= values.length) return UNKNOWN;
+      const v = values[Number(m[1])];
+      out += v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      i += m[0].length - 1;
+      continue;
+    }
+    if (c === "}") return UNKNOWN;
+    out += c;
+  }
+  return out;
+}
+function fullyKnown(v) {
+  if (v === UNKNOWN || isOpaque(v)) return false;
+  if (Array.isArray(v)) return v.every(fullyKnown);
+  if (v && typeof v === "object") return Boolean(v[COMPLETE]) && Object.values(v).every(fullyKnown);
+  return true;
+}
+function markComplete(v) {
+  if (Array.isArray(v)) v.forEach(markComplete);
+  else if (v && typeof v === "object") {
+    v[COMPLETE] = true;
+    Object.values(v).forEach(markComplete);
+  }
+  return v;
+}
+function toNumber(v) {
+  if (v === null) return 0;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (t === "") return 0;
+    const n = /^0x[0-9a-f]+$/i.test(t) ? parseInt(t, 16) : Number(t);
+    return Number.isNaN(n) ? NaN : n;
+  }
+  return NaN;
+}
+function compare(op, a, b) {
+  if (isOpaque(a) || isOpaque(b)) {
+    const [o, other] = isOpaque(a) ? [a, b] : [b, a];
+    if (typeof other === "string" && o.differsFrom.includes(other.toLowerCase()) && (op === "==" || op === "!=")) return op === "!=";
+    return UNKNOWN;
+  }
+  let x = a;
+  let y = b;
+  if (typeof x === "string" && typeof y === "string") {
+    x = x.toLowerCase();
+    y = y.toLowerCase();
+  } else if (typeof x !== typeof y || typeof x === "object" && x !== null || typeof y === "object" && y !== null) {
+    if (typeof x === "object" && x !== null || typeof y === "object" && y !== null) {
+      if (op === "==") return x === y;
+      if (op === "!=") return x !== y;
+      return false;
+    }
+    x = toNumber(x);
+    y = toNumber(y);
+    if (Number.isNaN(x) || Number.isNaN(y)) return op === "!=";
+  }
+  switch (op) {
+    case "==":
+      return x === y;
+    case "!=":
+      return x !== y;
+    case "<":
+      return x < y;
+    case "<=":
+      return x <= y;
+    case ">":
+      return x > y;
+    case ">=":
+      return x >= y;
+    default:
+      return UNKNOWN;
+  }
+}
+function call(name, args, ctx) {
+  if (name === "always") return true;
+  if (name === "success" || name === "failure") {
+    const status = ctx && ctx[STATUS];
+    if (status && status.hasNeeds === false) return name === "success";
+    return UNKNOWN;
+  }
+  if (name === "cancelled") return UNKNOWN;
+  if (!args.every(fullyKnown)) return UNKNOWN;
+  switch (name) {
+    case "fromjson":
+      try {
+        return markComplete(JSON.parse(String(args[0])));
+      } catch {
+        return UNKNOWN;
+      }
+    case "tojson":
+      return JSON.stringify(args[0]);
+    case "contains":
+      return Array.isArray(args[0]) ? args[0].some((x) => compare("==", x, args[1]) === true) : String(args[0]).toLowerCase().includes(String(args[1]).toLowerCase());
+    case "startswith":
+      return String(args[0]).toLowerCase().startsWith(String(args[1]).toLowerCase());
+    case "endswith":
+      return String(args[0]).toLowerCase().endsWith(String(args[1]).toLowerCase());
+    case "format":
+      return format(String(args[0]), args.slice(1));
+    default:
+      return UNKNOWN;
+  }
+}
+function evaluate(node, ctx) {
+  switch (node.k) {
+    case "lit":
+      return node.v;
+    case "ctx":
+      return get(ctx, node.path[0]);
+    case "prop":
+      return get(evaluate(node.of, ctx), node.key);
+    case "index": {
+      const key = evaluate(node.key, ctx);
+      return key === UNKNOWN ? UNKNOWN : get(evaluate(node.of, ctx), key);
+    }
+    case "call":
+      return call(node.name, node.args.map((a) => evaluate(a, ctx)), ctx);
+    case "!": {
+      const v = evaluate(node.a, ctx);
+      return v === UNKNOWN ? UNKNOWN : !truthy(v);
+    }
+    case "&&": {
+      const a = evaluate(node.a, ctx);
+      if (falsy(a)) return a;
+      const b = evaluate(node.b, ctx);
+      if (a === UNKNOWN) return falsy(b) ? b : UNKNOWN;
+      return b;
+    }
+    case "||": {
+      const a = evaluate(node.a, ctx);
+      if (truthy(a)) return a;
+      const b = evaluate(node.b, ctx);
+      if (a === UNKNOWN) return UNKNOWN;
+      return b;
+    }
+    default: {
+      const a = evaluate(node.a, ctx);
+      const b = evaluate(node.b, ctx);
+      if (a === UNKNOWN || b === UNKNOWN) return UNKNOWN;
+      return compare(node.k, a, b);
+    }
+  }
+}
+function valueOf(field, ctx, { isIf = false } = {}) {
+  if (field === void 0) return void 0;
+  if (Array.isArray(field)) return field.map((f) => valueOf(f, ctx));
+  if (field && typeof field === "object") return Object.fromEntries(Object.entries(field).map(([k, v]) => [k, valueOf(v, ctx)]));
+  if (typeof field !== "string") return field;
+  const whole = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(field);
+  if (whole || isIf) {
+    try {
+      return evaluate(parseExpr(whole ? whole[1] : field), ctx);
+    } catch {
+      return UNKNOWN;
+    }
+  }
+  if (field.includes("${{")) {
+    let unknown = false;
+    const out = field.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, e) => {
+      let v;
+      try {
+        v = evaluate(parseExpr(e), ctx);
+      } catch {
+        v = UNKNOWN;
+      }
+      if (v === UNKNOWN || isOpaque(v) || v && typeof v === "object") unknown = true;
+      return unknown ? "" : String(v ?? "");
+    });
+    return unknown ? UNKNOWN : out;
+  }
+  return field;
+}
+function forkPullRequestContext(repo = "owner/repo", event = "pull_request", { hasNeeds } = {}) {
+  const [owner] = String(repo).split("/");
+  const headRef = opaque([], "head-ref");
+  const pr = {
+    head: { repo: { full_name: opaque([repo], "head-repo"), fork: true, owner: { login: opaque([owner]) } }, sha: opaque([], "head-sha"), ref: headRef },
+    base: { repo: { full_name: repo, owner: { login: owner } }, sha: opaque([], "base-sha"), ref: opaque([], "base-ref") }
+  };
+  const github = { repository: repo, repository_owner: owner, event_name: event, event: { pull_request: pr }, head_ref: headRef };
+  if (event === "pull_request_target") github.sha = opaque([], "base-sha");
+  return { [STATUS]: { hasNeeds }, github };
+}
+
+// src/workflow.mjs
 var CATS = [
   ["overhead", /^(set up job|complete job|set up runner|complete runner)$/],
   // actions/checkout, or a step named for it; not a test suite that happens to say "checkout".
@@ -7735,6 +8110,67 @@ function workflowFacts(doc) {
     checkout
   };
 }
+function picksSelfHosted(value, raw) {
+  const mentions = /self-hosted/i.test(typeof raw === "string" ? raw : JSON.stringify(raw ?? ""));
+  if (value === UNKNOWN) return mentions ? null : false;
+  if (Array.isArray(value)) {
+    if (value.some((v) => typeof v === "string" && /self-hosted/i.test(v))) return true;
+    return value.some((v) => v === UNKNOWN) && mentions ? null : false;
+  }
+  if (value && typeof value === "object") {
+    if (value.labels === void 0) return false;
+    if (value.labels === UNKNOWN) return mentions ? null : false;
+    return picksSelfHosted([].concat(value.labels), raw);
+  }
+  return typeof value === "string" && /self-hosted/i.test(value);
+}
+function checkoutRunsForkCode(ref, repository, baseRepo) {
+  const refTag = opaqueTag(ref);
+  if (refTag === "head-sha") return "yes";
+  if (refTag === "base-sha") return "no";
+  if (ref === UNKNOWN || ref !== null && typeof ref !== "string" && !refTag) return "maybe";
+  if (repository === UNKNOWN) return "maybe";
+  const repoTag = opaqueTag(repository);
+  if (repoTag === "head-repo") return "yes";
+  if (repoTag) return "maybe";
+  if (repository !== null && typeof repository !== "string") return "maybe";
+  return "no";
+}
+function forkReachableSelfHosted(doc, repo = "owner/repo") {
+  const triggers = triggersOf(doc);
+  const events = ["pull_request", "pull_request_target"].filter((e) => triggers.includes(e));
+  const out = [];
+  for (const [id, job] of Object.entries(doc.jobs || {})) {
+    if (!job || typeof job !== "object" || job["runs-on"] === void 0) continue;
+    const hasNeeds = job.needs !== void 0 && !(Array.isArray(job.needs) && job.needs.length === 0);
+    for (const event of events) {
+      const ctx = forkPullRequestContext(repo, event, { hasNeeds });
+      let checkoutCertain = true;
+      if (event === "pull_request_target") {
+        const stepCtx = forkPullRequestContext(repo, event);
+        const verdicts = stepsOfJob(job).filter((st) => st && typeof st === "object" && /^actions\/checkout@/.test(String(st.uses || ""))).map((st) => {
+          const cond2 = st.if === void 0 ? true : valueOf(st.if, stepCtx, { isIf: true });
+          if (cond2 !== UNKNOWN && !cond2) return "no";
+          const inputs = st.with && typeof st.with === "object" ? st.with : {};
+          const ref = inputs.ref === void 0 ? null : valueOf(inputs.ref, stepCtx);
+          const repoIn = inputs.repository === void 0 ? null : valueOf(inputs.repository, stepCtx);
+          let which = checkoutRunsForkCode(ref, repoIn, repo);
+          if (which === "yes" && cond2 === UNKNOWN) which = "maybe";
+          return which;
+        });
+        if (!verdicts.some((v) => v !== "no")) continue;
+        checkoutCertain = verdicts.includes("yes");
+      }
+      const cond = job.if === void 0 ? true : valueOf(job.if, ctx, { isIf: true });
+      if (cond !== UNKNOWN && !cond) continue;
+      const picks = picksSelfHosted(valueOf(job["runs-on"], ctx), job["runs-on"]);
+      if (picks === false) continue;
+      out.push({ job: id, runsOn: job["runs-on"], event, certain: cond !== UNKNOWN && picks === true && checkoutCertain });
+      break;
+    }
+  }
+  return out;
+}
 
 // src/util.mjs
 function secs(a, b) {
@@ -7890,6 +8326,19 @@ ${lines.join("\n")}` };
     example: "# on the existing actions/checkout step: fetch only the directories the job reads\n# (cone mode, the default: list directories; files at the root are always included)\nwith:\n  sparse-checkout: |\n    src\n    test"
   };
 }
+var FORK_TO_HOSTED = "github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest'";
+function forkGuardExample(runsOn) {
+  if (typeof runsOn === "string") {
+    const whole = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(runsOn);
+    if (whole) return `runs-on: \${{ ${FORK_TO_HOSTED} || (${whole[1].trim()}) }}`;
+    if (runsOn.includes("${{")) return "";
+    return `runs-on: \${{ ${FORK_TO_HOSTED} || '${runsOn.replace(/'/g, "''")}' }}`;
+  }
+  if (Array.isArray(runsOn) && runsOn.every((l) => typeof l === "string" && !l.includes("${{"))) {
+    return `runs-on: \${{ ${FORK_TO_HOSTED} || fromJSON('${JSON.stringify(runsOn).replace(/'/g, "''")}') }}`;
+  }
+  return "";
+}
 
 // src/analyse.mjs
 var THRESHOLDS = {
@@ -8011,7 +8460,7 @@ function outdatedRuns(workflowRuns) {
 function longestSteps(workStepSeconds) {
   return [...workStepSeconds.entries()].map(([step, seconds]) => ({ step, median_s: median(seconds), seen: seconds.length })).sort((a, b) => b.median_s - a.median_s || (a.step < b.step ? 1 : a.step > b.step ? -1 : 0) || b.seen - a.seen).slice(0, 3).map((s) => ({ ...s, median_s: Math.round(s.median_s) }));
 }
-function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, weekFactor) {
+function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, weekFactor, repo = "owner/repo") {
   const doc = parseWorkflow(fileText);
   const facts = workflowFacts(doc);
   const timing = timeJobs(sampledRuns, stepCommands(doc));
@@ -8070,6 +8519,7 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
     concurrency_group: concurrencyGroupOf(doc),
     events,
     installers: facts.installers,
+    fork_reachable: forkReachableSelfHosted(doc, repo),
     checkout: facts.checkout,
     fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3)
   };
@@ -8231,7 +8681,7 @@ function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch =
     );
   }
   const billed = w.billed_minutes_week;
-  if (!isPublic && typeof billed === "number" && w.hosted_share >= 0.5 && billed >= T.billedRatio * w.job_minutes_week && billed - w.job_minutes_week >= T.billedExcessWeek) {
+  if (isPublic !== true && typeof billed === "number" && w.hosted_share >= 0.5 && billed >= T.billedRatio * w.job_minutes_week && billed - w.job_minutes_week >= T.billedExcessWeek) {
     const jobsWeek = w.jobs_per_run * (w.runs_week - (w.skipped_week || 0));
     add(
       0.5 * (billed - w.job_minutes_week),
@@ -8241,7 +8691,60 @@ function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch =
       { tradeoff: "a merged job reports one status where there were several; a self-hosted runner is yours to run, patch and secure", unit: "billed" }
     );
   }
+  const reach = w.fork_reachable || [];
+  if (reach.length && isPublic !== "private") {
+    const label = (r) => typeof r.runsOn === "string" ? r.runsOn : JSON.stringify(r.runsOn);
+    const certain = reach.filter((r) => r.certain);
+    const jobsText = reach.slice(0, 5).map((r) => `${r.job} (runs-on ${label(r)}${r.event === "pull_request_target" ? ", on pull_request_target with the head checked out" : ""}${r.certain ? "" : ", depending on a value the audit cannot resolve"})`).join("; ");
+    const example = forkGuardExample(reach[0].runsOn);
+    const notPublic = isPublic === true ? "" : " (if the repository is public; its visibility could not be read)";
+    add(
+      0,
+      "fork pull requests run on self-hosted runners",
+      `evaluated for a pull request from a fork, ${reach.length === 1 ? "job" : "jobs"} ${jobsText} ${certain.length ? reach.length === 1 ? "picks" : "pick" : "can pick"} a self-hosted runner, so a fork's code ${certain.length ? "runs" : "can run"} on your machine${notPublic}`,
+      "send a fork's pull requests to a GitHub-hosted runner and keep the job's own runner selection for everything else" + (example ? "" : " (this job's selection has expressions inside a list or a runner group, so wrap it by hand rather than rewrite it)") + "; GitHub's approval of fork workflows is a second line, not the guard",
+      {
+        confidence: isPublic === true && certain.length ? "confirmed" : "inferred",
+        tradeoff: "a fork's checks then run on a GitHub-hosted runner, slower to start or billed on a private repository, and a job that needs something only the self-hosted machine has must skip for forks",
+        example,
+        unit: "risk"
+      }
+    );
+  }
   return F;
+}
+function runnerReuseFinding(samples) {
+  const byRunner = /* @__PURE__ */ new Map();
+  let selfHostedJobs = 0;
+  for (const [wf, jobsPerRun] of samples) {
+    for (const jobs of jobsPerRun) {
+      for (const job of jobs) {
+        if (ranOnGitHubHosted(job) || job.runner_id == null || !Number(job.runner_id)) continue;
+        selfHostedJobs++;
+        const id = Number(job.runner_id);
+        if (!byRunner.has(id)) byRunner.set(id, { name: String(job.runner_name || id), jobs: 0, workflows: /* @__PURE__ */ new Set() });
+        const r = byRunner.get(id);
+        r.jobs++;
+        r.workflows.add(wf);
+      }
+    }
+  }
+  const reused = [...byRunner.values()].filter((r) => r.jobs > 1).sort((a, b) => b.jobs - a.jobs);
+  if (!reused.length) return [];
+  const reusedJobs = sum(reused.map((r) => r.jobs));
+  const top = reused[0];
+  const workflows = [...new Set(reused.flatMap((r) => [...r.workflows]))];
+  return [{
+    saving: 0,
+    unit: "risk",
+    confidence: "measured",
+    what: "self-hosted runners reused across jobs",
+    workflow: workflows.length === 1 ? workflows[0] : `${workflows.length} workflows: ${workflows.slice(0, 5).join(", ")}${workflows.length > 5 ? " and more" : ""}`,
+    evidence: `${reusedJobs} of ${selfHostedJobs} sampled self-hosted jobs ran on ${reused.length === 1 ? "a runner" : `${reused.length} runners`} that took more than one job (${top.name} took ${top.jobs}), so those runners are persistent: a job can find the workspace, files, processes and tool cache the job before it left`,
+    fix: "ephemeral runners: one job per registration (just-in-time configuration, or config.sh --ephemeral), each starting from a clean directory; keep start latency low with a warm runner waiting for the next job",
+    tradeoff: "every job re-registers (seconds, hidden by a warm runner), and nothing a job leaves on disk survives for the next, so caches go through actions/cache or a read-only tool cache",
+    example: ""
+  }];
 }
 function repoFindings(workflows) {
   const F = [];
@@ -8317,7 +8820,8 @@ function groupFindings(F) {
     const evidence = wfs.length === 1 ? g.evidence : `${g.evidence} (shown for the largest; the same holds in the others)`;
     out.push({ ...g, workflow: where, evidence, workflows: void 0 });
   }
-  return out.sort((a, b) => b.saving - a.saving);
+  const risk = (f) => f.unit === "risk" ? 1 : 0;
+  return out.sort((a, b) => risk(b) - risk(a) || b.saving - a.saving);
 }
 function analyse(repo, data) {
   const week = 7 / data.coveredDays;
@@ -8328,11 +8832,11 @@ function analyse(repo, data) {
     if (!jobsPerRun.length) continue;
     const rs = data.byWf.get(wf);
     const path = String(rs[0].path || "").split("@")[0];
-    workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week));
+    workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week, repo));
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
-  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" })), ...repoFindings(workflows)];
-  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.saving >= T.minSavingWeek).map((f) => ({
+  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map())];
+  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",
     workflow: f.workflow,
@@ -8370,7 +8874,9 @@ function shareText(w, n = 3) {
   return Object.entries(w.share || {}).slice(0, n).map(([k, v]) => `${k} ${Math.round(v * 100)}%`).join(", ");
 }
 var isWait = (f) => f.unit === "wait" || !f.unit && !(f.saving_min_week >= 1);
+var isRisk = (f) => f.unit === "risk";
 function savingText(f) {
+  if (isRisk(f)) return "a security and stability risk, not minutes";
   if (isWait(f)) return "saves developer wait, not job minutes";
   const unit = f.unit === "billed" ? "billed" : "job";
   if (!(f.saving_min_week >= 1)) return `under 1 ${unit}-min/week (estimate)`;
@@ -8388,9 +8894,10 @@ function budgetText(a) {
 }
 function summary(a) {
   const L = [];
-  const waitOnly = a.findings.filter(isWait);
-  const jobFindings = a.findings.filter((f) => !isWait(f) && f.unit !== "billed");
-  const billedFindings = a.findings.filter((f) => !isWait(f) && f.unit === "billed");
+  const risks = a.findings.filter(isRisk);
+  const waitOnly = a.findings.filter((f) => !isRisk(f) && isWait(f));
+  const jobFindings = a.findings.filter((f) => !isRisk(f) && !isWait(f) && f.unit !== "billed");
+  const billedFindings = a.findings.filter((f) => !isRisk(f) && !isWait(f) && f.unit === "billed");
   const total = Math.round(a.job_minutes_week_sampled || 0);
   const billed = num(a.billed_minutes_week_sampled) ? Math.round(a.billed_minutes_week_sampled) : null;
   const free = a.visibility === "public";
@@ -8403,6 +8910,7 @@ function summary(a) {
   const top = a.findings[0];
   L.push(`**Start with:** ${top.what} in *${top.workflow}*: ${savingText(top)}.`, "");
   const parts = [];
+  if (risks.length) parts.push(`${plural(risks.length, "finding")} ${risks.length === 1 ? "is a security risk" : "are security risks"} to fix before any saving`);
   if (jobFindings.length) {
     const saved = Math.round(a.saving_min_week_total ?? jobFindings.reduce((s, f) => s + f.saving_min_week, 0));
     const share = total > 0 ? ` (${Math.round(100 * saved / total)}%)` : "";

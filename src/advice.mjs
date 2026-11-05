@@ -134,3 +134,27 @@ export function checkoutAdvice(checkout = {}) {
     example: '# on the existing actions/checkout step: fetch only the directories the job reads\n# (cone mode, the default: list directories; files at the root are always included)\nwith:\n  sparse-checkout: |\n    src\n    test',
   };
 }
+
+// Only a pull request carries a head repository: on a push, a schedule or a dispatch the head is
+// empty, which also differs from github.repository, so the guard first requires a pull request.
+const FORK_TO_HOSTED = "github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest'";
+
+/**
+ * runs-on that sends a fork's pull requests to a GitHub-hosted runner and keeps the job's own
+ * runner selection, unchanged, for everything else. A whole-expression runs-on is wrapped as it is;
+ * a static label or list goes through fromJSON. A list or label object with expressions inside
+ * (a matrix label, a runner group) cannot be carried into one expression without changing it, so
+ * there is no example then (empty string), rather than one that drops a constraint.
+ */
+export function forkGuardExample(runsOn) {
+  if (typeof runsOn === 'string') {
+    const whole = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(runsOn);
+    if (whole) return `runs-on: \${{ ${FORK_TO_HOSTED} || (${whole[1].trim()}) }}`;
+    if (runsOn.includes('${{')) return '';
+    return `runs-on: \${{ ${FORK_TO_HOSTED} || '${runsOn.replace(/'/g, "''")}' }}`;
+  }
+  if (Array.isArray(runsOn) && runsOn.every((l) => typeof l === 'string' && !l.includes('${{'))) {
+    return `runs-on: \${{ ${FORK_TO_HOSTED} || fromJSON('${JSON.stringify(runsOn).replace(/'/g, "''")}') }}`;
+  }
+  return '';
+}
