@@ -346,3 +346,92 @@ export function forkReachableSelfHosted(doc, repo = 'owner/repo') {
   }
   return out;
 }
+
+/** GitHub's job timeout when timeout-minutes is not set, in minutes. */
+export const DEFAULT_JOB_TIMEOUT = 360;
+
+/**
+ * Each job's timeout as the file sets it: the job id, the name GitHub shows for it (its name, or
+ * its id), the minutes (DEFAULT_JOB_TIMEOUT when unset), and whether that is the default. A
+ * timeout set by an expression, or a job that calls a reusable workflow (whose own jobs carry the
+ * timeouts), is left out: the file does not say what the limit is.
+ * @returns {{ id: string, name: string, minutes: number, isDefault: boolean }[]}
+ */
+export function jobTimeouts(doc) {
+  return allJobTimeouts(doc).filter((t) => t.judged).map(({ judged, ...t }) => t);
+}
+
+/**
+ * Every job of the file, judged or not: `judged` is false for a job whose limit the file does not
+ * say (an expression timeout, a reusable-workflow call). Those still take part in matching runs to
+ * jobs, so their runs are never credited to another job.
+ */
+export function allJobTimeouts(doc) {
+  const out = [];
+  for (const [id, job] of Object.entries(doc.jobs || {})) {
+    if (!job || typeof job !== 'object') continue;
+    const raw = job['timeout-minutes'];
+    const name = typeof job.name === 'string' ? job.name : id;
+    if (job.uses !== undefined) out.push({ id, name, minutes: null, isDefault: false, judged: false, reusable: true });
+    else if (raw === undefined || raw === null) out.push({ id, name, minutes: DEFAULT_JOB_TIMEOUT, isDefault: true, judged: true });
+    else if (typeof raw === 'number' && Number.isFinite(raw)) out.push({ id, name, minutes: raw, isDefault: false, judged: true });
+    else if (typeof raw === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(raw)) out.push({ id, name, minutes: Number(raw), isDefault: false, judged: true });
+    else out.push({ id, name, minutes: null, isDefault: false, judged: false });
+  }
+  return out;
+}
+
+/**
+ * How a file job's name matches the names GitHub gives its runs, and how specific the match is
+ * (the length of its literal text). A static name matches itself and its matrix legs
+ * ("test (20, ubuntu)"). A name with expressions matches with each expression standing for any
+ * text, every literal part kept in place; GitHub adds no matrix suffix to such a name. A name with
+ * no literal text matches nothing.
+ */
+export function jobNamePattern(fileJobName, { reusable = false } = {}) {
+  const base = String(fileJobName);
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // A reusable-workflow call runs no job of its own: its runs are the called workflow's jobs, named
+  // "<call> / <job>" (a matrix leg "<call> (a) / <job>"). It claims those before any ordinary job,
+  // so its children's runs are never credited to a job that only shares its name.
+  if (reusable) {
+    const literals = base.split(/\$\{\{[\s\S]*?\}\}/);
+    if (!literals.join('').trim()) return { rx: /(?!)/, specificity: 0 };
+    const head = base.includes('${{') ? literals.map(esc).join('[\\s\\S]*') : `${esc(base)}( \\(.*\\))?`;
+    return { rx: new RegExp(`^${head} / [\\s\\S]+$`), specificity: Infinity };
+  }
+  if (base.includes('${{')) {
+    const literals = base.split(/\$\{\{[\s\S]*?\}\}/);
+    // A name that is all expression has no text to recognise its runs by: it matches nothing.
+    if (!literals.join('').trim()) return { rx: /(?!)/, specificity: 0 };
+    return { rx: new RegExp(`^${literals.map(esc).join('[\\s\\S]*')}$`), specificity: literals.join('').length };
+  }
+  return { rx: new RegExp(`^${esc(base)}( \\(.*\\))?$`), specificity: base.length + 1 };
+}
+
+/** The API job names that are runs of a file job (see jobNamePattern). */
+export function jobRunsOf(fileJobName, apiNames) {
+  const { rx } = jobNamePattern(fileJobName);
+  return apiNames.filter((n) => rx.test(n));
+}
+
+/**
+ * Each API job name assigned to at most one file job: the most specific pattern that matches it. A
+ * name two jobs match equally well is ambiguous and goes to neither, so no job is judged on
+ * another's runs.
+ * @returns {Map<string, string[]>} file job id (or name) -> its API job names
+ */
+export function assignJobRuns(fileJobNames, apiNames) {
+  // Each entry is a name, or { id, name, reusable }. Results are keyed by the job id when there is
+  // one (else the name), since two jobs can share a display name and must not share runs.
+  const patterns = fileJobNames.map((j) => (typeof j === 'string'
+    ? { key: j, ...jobNamePattern(j) }
+    : { key: j.id ?? j.name, ...jobNamePattern(j.name, { reusable: j.reusable }) }));
+  const out = new Map(patterns.map((p) => [p.key, []]));
+  for (const api of apiNames) {
+    const hits = patterns.filter((p) => p.rx.test(api)).sort((a, b) => b.specificity - a.specificity);
+    if (!hits.length || (hits[1] && hits[1].specificity === hits[0].specificity)) continue;
+    out.get(hits[0].key).push(api);
+  }
+  return out;
+}
