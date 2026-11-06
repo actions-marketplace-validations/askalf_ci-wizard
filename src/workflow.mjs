@@ -25,14 +25,36 @@ export function category(name) {
   return 'work';
 }
 
+// The scans, the merge-gate checks and the measurements each read the same files. Inside an audit
+// (withParseCache) a parsed file is kept by its text for the whole audit, so each is parsed once;
+// the cache goes with the audit, so a long-lived process holds nothing between audits. Outside one,
+// every call parses. Callers treat the document as read-only.
+let parsed = null;
+
+/** Runs fn (synchronous) with one parse per distinct workflow text; a nested call shares the outer cache. */
+export function withParseCache(fn) {
+  if (parsed) return fn();
+  parsed = new Map();
+  try {
+    return fn();
+  } finally {
+    parsed = null;
+  }
+}
+
 export function parseWorkflow(text) {
   if (!text) return {};
+  const key = String(text);
+  if (parsed && parsed.has(key)) return parsed.get(key);
+  let doc;
   try {
-    const doc = parse(text, { uniqueKeys: false });
-    return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {};
+    doc = parse(key, { uniqueKeys: false });
+    doc = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {};
   } catch {
-    return {};
+    doc = {};
   }
+  if (parsed) parsed.set(key, doc);
+  return doc;
 }
 
 // A job's steps as a list. A file that gives `steps` as anything else (a mapping, a number) has no
@@ -166,6 +188,190 @@ export function cacheInputOn(value) {
 function majorOf(uses) {
   const m = /@v(\d+)/.exec(uses);
   return m ? Number(m[1]) : null;
+}
+
+/**
+ * The simple commands of a shell script, each as its words with the quotes taken off. Commands are
+ * split at newlines, `;`, `&`, `|` and parentheses outside quotes; comments and here-document
+ * bodies are dropped. A quoted word stays one word, so the text passed to a command (an echo's
+ * message, a heredoc's lines) is never read as a command of its own. Expansions are left as
+ * written, and a command inside a quoted string (`bash -c "..."`) is not looked into.
+ */
+export function shellCommands(script) {
+  const s = String(script || '');
+  const commands = [];
+  const heredocs = [];
+  let words = [];
+  let word = '';
+  let inWord = false;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = '';
+    inWord = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (words.length) commands.push(words);
+    words = [];
+  };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') {
+      // A backslash before a newline continues the line; before anything else it quotes it.
+      if (s[i + 1] !== '\n' && i + 1 < s.length) {
+        word += s[i + 1];
+        inWord = true;
+      }
+      i += 1;
+    } else if (c === "'") {
+      const end = s.indexOf("'", i + 1);
+      const stop = end === -1 ? s.length : end;
+      word += s.slice(i + 1, stop);
+      inWord = true;
+      i = stop;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1;
+      word += s.slice(i + 1, Math.min(j, s.length));
+      inWord = true;
+      i = j;
+    } else if (c === '#' && !inWord) {
+      const nl = s.indexOf('\n', i);
+      i = (nl === -1 ? s.length : nl) - 1;
+    } else if (s.startsWith('<<<', i)) {
+      // A here-string: the word after it is input, read as an ordinary word.
+      endWord();
+      i += 2;
+    } else if (s.startsWith('$((', i) || (c === '(' && s[i + 1] === '(' && !inWord)) {
+      // Arithmetic, $((...)) or ((...)): its << is a shift, not a here-document. Kept as one word.
+      const end = s.indexOf('))', i + 2);
+      const stop = end === -1 ? s.length : end + 2;
+      if (c === '(') endCommand();
+      word += s.slice(i, stop);
+      inWord = true;
+      if (c === '(') endCommand();
+      i = stop - 1;
+    } else if (c === '<' && s.startsWith('<<', i)) {
+      // A here-document: its body, from the next line to the delimiter, is input, not commands.
+      const tabs = s[i + 2] === '-';
+      const d = heredocWord(s, i + (tabs ? 3 : 2));
+      if (d) {
+        endWord();
+        heredocs.push({ delim: d.word, tabs });
+        i = d.end - 1;
+      } else {
+        word += c;
+        inWord = true;
+      }
+    } else if (c === '\n') {
+      endCommand();
+      let j = i + 1;
+      while (heredocs.length) {
+        // The delimiter line matches exactly; <<- strips leading tabs first, nothing else.
+        const { delim, tabs } = heredocs.shift();
+        while (j < s.length) {
+          const nl = s.indexOf('\n', j);
+          const end = nl === -1 ? s.length : nl;
+          const line = s.slice(j, end);
+          j = end + 1;
+          if ((tabs ? line.replace(/^\t+/, '') : line) === delim) break;
+        }
+      }
+      i = Math.min(j, s.length) - 1;
+    } else if (c === ' ' || c === '\t' || c === '\r') {
+      endWord();
+    } else if (';&|()'.includes(c)) {
+      endCommand();
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  endCommand();
+  return commands;
+}
+
+// A here-document's delimiter: the shell word after << (spaces first), with its quotes removed, so
+// 'END-TEXT', "EOF" and E\OF are END-TEXT, EOF and EOF. Null when no word follows.
+function heredocWord(s, from) {
+  let i = from;
+  while (s[i] === ' ' || s[i] === '\t') i += 1;
+  let word = '';
+  let present = false; // a quoted empty word ('') is a delimiter: an empty line ends it
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'" || c === '"') {
+      const end = s.indexOf(c, i + 1);
+      if (end === -1) return null;
+      word += s.slice(i + 1, end);
+      present = true;
+      i = end;
+    } else if (c === '\\' && i + 1 < s.length && s[i + 1] !== '\n') {
+      word += s[i + 1];
+      present = true;
+      i += 1;
+    } else if (/[\s;&|()<>]/.test(c)) {
+      break;
+    } else {
+      word += c;
+      present = true;
+    }
+  }
+  return present ? { word, end: i } : null;
+}
+
+// Programs that run the command after them, each with the options of its that take a value (as
+// the next word, or after = in a long option): `sudo -u root semgrep ci` runs semgrep, not root.
+// After `--`, the next word is the program. Reserved words that open a compound command come
+// before a command too: `then semgrep ci`.
+const WRAPPERS = new Map([
+  ['sudo', ['-u', '-g', '-h', '-p', '-C', '-D', '-r', '-t', '-T', '-U', '--user', '--group', '--host', '--prompt', '--close-from', '--chdir', '--role', '--type', '--command-timeout', '--other-user']],
+  ['env', ['-u', '-C', '--unset', '--chdir']],
+  ['nice', ['-n', '--adjustment']],
+  ['time', ['-f', '-o', '--format', '--output']],
+  ['exec', ['-a']],
+  ['command', []],
+  ['npx', ['-p', '--package']],
+  ['pnpx', []],
+  ['bunx', ['-p', '--package']],
+  ['uvx', ['-p', '--python', '--from', '--with', '--with-editable', '--with-requirements', '-c', '--constraints', '--index', '--default-index', '--index-url', '--extra-index-url', '-f', '--find-links', '--directory', '--project', '--config-file', '--cache-dir']],
+].map(([name, valued]) => [name, new Set(valued)]));
+const OPENERS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{']);
+// Wrapper options that make it look a name up instead of running it: command -v semgrep runs nothing.
+const LOOKUPS = new Map([['command', new Set(['-v', '-V'])]]);
+
+/**
+ * A command's words from the program it runs, past reserved words that open a compound command,
+ * assignments, and wrappers with their options and option values, with the program's directory
+ * dropped.
+ */
+export function programWords(words) {
+  let k = 0;
+  while (k < words.length && OPENERS.has(words[k])) k += 1;
+  let wrapper = null; // the options of the innermost wrapper seen so far
+  let lookups = null;
+  while (k < words.length) {
+    const w = words[k];
+    if (WRAPPERS.has(w)) {
+      wrapper = WRAPPERS.get(w);
+      lookups = LOOKUPS.get(w) || null;
+    } else if (lookups && lookups.has(w)) {
+      return [];
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+      // FOO=1 before a command (or after env) sets a variable for it.
+    } else if (wrapper && w === '--') {
+      k += 1;
+      break;
+    } else if (wrapper && w.startsWith('-')) {
+      if (wrapper.has(w)) k += 1; // its value is the next word; --user=root carries its own
+    } else {
+      break;
+    }
+    k += 1;
+  }
+  const rest = words.slice(k);
+  if (rest.length) rest[0] = rest[0].split('/').pop();
+  return rest;
 }
 
 /** The package managers a workflow installs with, from its run lines and setup actions, in a fixed order. */

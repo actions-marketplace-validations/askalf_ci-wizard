@@ -259,3 +259,111 @@ test('two rulesets requiring the same name, one from any app and one from Action
     assert.doesNotMatch(f.evidence, /not judged/); // "test" was judged through its Actions binding
   }
 });
+
+test('code scanning: Semgrep, Snyk, SonarSource scans, Bearer and a code scanner\'s SARIF upload count; a Scorecard upload or a quality gate does not', () => {
+  const g = gates({ code_scanning_runs: false });
+  const job = (steps, extra = '') => `on: [pull_request]\njobs:\n  scan:\n    runs-on: ubuntu-latest\n${extra}    steps:\n${steps}`;
+  const counts = (text) => !whats(gateFindings(g, { scanFiles: files(text), scanned: all(1) })).includes('no code scanning');
+  assert.ok(counts(job('      - uses: semgrep/semgrep-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(counts(job('      - uses: snyk/actions/node@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // Snyk's setup action installs the CLI; the scan is the command after it.
+  assert.ok(counts(job('      - uses: snyk/actions/setup@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      - run: snyk code test\n')));
+  assert.ok(counts(job('      - uses: SonarSource/sonarqube-scan-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(counts(job('      - run: semgrep ci --sarif > out.sarif\n')));
+  // After an assignment, a wrapper, a path or another command on the line, it is still a run.
+  assert.ok(counts(job('      - run: SEMGREP_APP_TOKEN=x semgrep ci\n')));
+  assert.ok(counts(job('      - run: cd app && npx -y snyk code test\n')));
+  assert.ok(counts(job('      - run: ./bin/bearer scan .\n')));
+  // Inside a conditional or a loop.
+  assert.ok(counts(job('      - run: if true; then semgrep ci; fi\n')));
+  // Through a wrapper whose option takes a value.
+  assert.ok(counts(job('      - run: sudo -u root semgrep ci\n')));
+  assert.ok(counts(job('      - run: env -u GITHUB_TOKEN semgrep ci\n')));
+  // A wrapper running another program that only mentions a scanner is not a scan.
+  assert.ok(!counts(job('      - run: sudo -u root echo semgrep ci\n')));
+  // After a here-string, a scan command still runs.
+  assert.ok(counts(job('      - run: |\n          cat <<< "hello"\n          semgrep ci\n')));
+  assert.ok(counts(job('      - run: if semgrep ci; then echo ok; fi\n')));
+  assert.ok(counts(job('      - run: for d in a b; do (cd $d && snyk code test); done\n')));
+  assert.ok(counts(job('      - run: |\n          while false\n          do\n            bearer scan .\n          done\n')));
+  assert.ok(counts(job('      - run: |\n          codeql database create db \\\n            --language=javascript\n')));
+  assert.ok(counts(job('      - run: semgrep ci\n', '    container:\n      image: semgrep/semgrep\n')));
+  // Bearer by its container (the image alone, and with its scan command), by command, and by action.
+  assert.ok(counts(job('      - run: bearer scan . --format sarif --output b.sarif\n', '    container:\n      image: bearer/bearer:latest\n')));
+  assert.ok(counts(job('      - run: make\n', '    container: bearer/bearer\n')));
+  assert.ok(counts(job('      - run: bearer scan .\n')));
+  assert.ok(counts(job('      - uses: bearer/bearer-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // A scanner image run as a step, and SonarSource's scanner image with a registry and a digest.
+  assert.ok(counts(job('      - uses: docker://semgrep/semgrep:1.90.0\n')));
+  assert.ok(counts(job('      - run: sonar-scanner\n', '    container:\n      image: docker.io/sonarsource/sonar-scanner-cli@sha256:abc\n')));
+  assert.ok(counts(job('      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // Near misses: Scorecard's or a workflow linter's SARIF is not about the code; a script that only
+  // mentions a scanner is not one.
+  assert.ok(!counts(job('      - uses: ossf/scorecard-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - uses: zizmorcore/zizmor-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: echo "we should add semgrep someday"\n')));
+  // A scanner's command is a run only where a command starts: not in an echoed message, a comment
+  // or a here-document's lines.
+  assert.ok(!counts(job('      - run: echo "run semgrep ci later"\n')));
+  // Looking a scanner up runs nothing.
+  assert.ok(!counts(job('      - run: command -v semgrep ci\n')));
+  assert.ok(!counts(job("      - run: printf '%s\\n' 'bearer scan' # snyk code test\n")));
+  assert.ok(!counts(job('      - run: |\n          cat > NOTES <<EOF\n          semgrep ci\n          EOF\n          make\n')));
+  // A line that only looks like the delimiter (a trailing space) does not end the here-document.
+  assert.ok(!counts(job("      - run: \"cat <<'EOF'\\nEOF \\nsemgrep ci\\nEOF\\n\"\n")));
+  // SonarSource's quality gate only waits for an earlier scan's result; a SonarQube server image
+  // is not a scan; an image whose name only contains a scanner's is another image.
+  assert.ok(!counts(job('      - uses: SonarSource/sonarqube-quality-gate-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - uses: snyk/actions/setup@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      - run: npm run build\n')));
+  // A here-document with an empty quoted delimiter, ended by an empty line.
+  assert.ok(!counts(job("      - run: \"cat <<''\\nsemgrep ci\\n\\n\"\n")));
+  // A linter run from its image, as a docker:// step or as the job's container: its SARIF is about workflows.
+  assert.ok(!counts(job('      - uses: docker://ghcr.io/zizmorcore/zizmor:latest\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: ./scripts/lint-workflows.sh\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', '    container:\n      image: rhysd/actionlint:1.7.7\n')));
+  // A here-document whose quoted delimiter has punctuation in it.
+  assert.ok(!counts(job("      - run: \"cat <<'END-TEXT'\\nsemgrep ci\\nEND-TEXT\\n\"\n")));
+  assert.ok(!counts(job('      - run: make\n', '    container:\n      image: sonarqube:lts-community\n')));
+  assert.ok(!counts(job('      - run: make\n', '    container:\n      image: example/bearer-token-tools:1\n')));
+  // A workflow linter run by command, whose SARIF is about the workflows.
+  assert.ok(!counts(job('      - run: actionlint -format "{{json .}}" > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: go run github.com/rhysd/actionlint/cmd/actionlint@latest -format "{{json .}}" > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: uvx zizmor --format sarif . > z.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: docker run --rm --entrypoint actionlint example/tools:1 -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: docker run --rm node:22 actionlint -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: pipx run --spec zizmor==1.5 zizmor --format sarif . > z.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // A linter's name as an option value, or as the scanner's own argument, is not a linter run.
+  assert.ok(counts(job('      - run: docker run --name actionlint aquasec/trivy fs --format sarif . > t.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(counts(job('      - run: docker run -e TOOL=zizmor -v "$PWD:/src" aquasec/trivy fs --skip-dirs actionlint --format sarif /src > t.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // An option's value that looks like --entrypoint is a value: the actionlint image's own program runs.
+  assert.ok(!counts(job("      - run: docker run --label '--entrypoint=echo' rhysd/actionlint:latest > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")));
+  assert.ok(!counts(job("      - run: docker run -e --entrypoint rhysd/actionlint:latest > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")));
+  // An empty --entrypoint clears the image's: echo runs, not actionlint.
+  assert.ok(counts(job("      - run: docker run --entrypoint '' rhysd/actionlint:latest echo hello\n      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")));
+  assert.ok(!counts(job("      - run: docker run --entrypoint= example/tools:1 actionlint -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")));
+  // Looking a linter up runs nothing.
+  assert.ok(counts(job('      - run: command -v actionlint || echo missing\n      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // An --entrypoint replaces the image's own: echo runs on the actionlint image, not actionlint.
+  assert.ok(counts(job('      - run: docker run --entrypoint echo rhysd/actionlint:latest hello\n      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // Global options before the subcommand, with their values.
+  assert.ok(!counts(job('      - run: go -C tools run github.com/rhysd/actionlint/cmd/actionlint@latest -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(!counts(job('      - run: docker --context ci run rhysd/actionlint:latest -format sarif > a.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // A linter run through uvx with a constraints file, as Home Assistant runs zizmor.
+  assert.ok(!counts(job('      - run: |\n          uvx --constraints requirements.txt zizmor \\\n            --format=sarif . > zizmor.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // With --entrypoint given, the words after the image are its arguments: echo runs, not actionlint.
+  assert.ok(counts(job('      - run: docker run --entrypoint echo node:22 actionlint\n      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // Words after the image that start with an option are the image's entrypoint's arguments.
+  assert.ok(counts(job('      - run: docker run aquasec/trivy --cache-dir actionlint fs --format sarif . > t.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(counts(job('      - run: go run -tags actionlint ./cmd/scan --sarif > s.sarif\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // Installing or pulling a linter without running it leaves a code scanner's upload counted.
+  assert.ok(counts(job('      - run: go install github.com/rhysd/actionlint/cmd/actionlint@latest\n      - run: trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  assert.ok(counts(job('      - run: docker pull rhysd/actionlint:latest && trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+  // A linter only mentioned does not make a code scanner's upload about workflows.
+  assert.ok(counts(job('      - run: echo "actionlint runs elsewhere"; trivy fs --format sarif -o t.sarif .\n      - uses: github/codeql-action/upload-sarif@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')));
+});
+
+test('a workflow file is parsed once in an audit: the scans and the gate checks share the document', async () => {
+  const { parseWorkflow, withParseCache } = await import('../src/workflow.mjs');
+  const text = 'on: [push]\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+  withParseCache(() => assert.equal(parseWorkflow(text), parseWorkflow(text)));
+});

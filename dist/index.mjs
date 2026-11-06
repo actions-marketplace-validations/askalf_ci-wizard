@@ -8219,14 +8219,29 @@ function category(name) {
   for (const [c, rx] of CATS) if (rx.test(n)) return c;
   return "work";
 }
+var parsed = null;
+function withParseCache(fn) {
+  if (parsed) return fn();
+  parsed = /* @__PURE__ */ new Map();
+  try {
+    return fn();
+  } finally {
+    parsed = null;
+  }
+}
 function parseWorkflow(text) {
   if (!text) return {};
+  const key = String(text);
+  if (parsed && parsed.has(key)) return parsed.get(key);
+  let doc;
   try {
-    const doc = (0, import_yaml.parse)(text, { uniqueKeys: false });
-    return doc && typeof doc === "object" && !Array.isArray(doc) ? doc : {};
+    doc = (0, import_yaml.parse)(key, { uniqueKeys: false });
+    doc = doc && typeof doc === "object" && !Array.isArray(doc) ? doc : {};
   } catch {
-    return {};
+    doc = {};
   }
+  if (parsed) parsed.set(key, doc);
+  return doc;
 }
 function stepsOfJob(job) {
   return job && Array.isArray(job.steps) ? job.steps : [];
@@ -8325,6 +8340,161 @@ function cacheInputOn(value) {
 function majorOf(uses) {
   const m = /@v(\d+)/.exec(uses);
   return m ? Number(m[1]) : null;
+}
+function shellCommands(script) {
+  const s = String(script || "");
+  const commands = [];
+  const heredocs = [];
+  let words = [];
+  let word = "";
+  let inWord = false;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = "";
+    inWord = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (words.length) commands.push(words);
+    words = [];
+  };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      if (s[i + 1] !== "\n" && i + 1 < s.length) {
+        word += s[i + 1];
+        inWord = true;
+      }
+      i += 1;
+    } else if (c === "'") {
+      const end = s.indexOf("'", i + 1);
+      const stop = end === -1 ? s.length : end;
+      word += s.slice(i + 1, stop);
+      inWord = true;
+      i = stop;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== '"') j += s[j] === "\\" ? 2 : 1;
+      word += s.slice(i + 1, Math.min(j, s.length));
+      inWord = true;
+      i = j;
+    } else if (c === "#" && !inWord) {
+      const nl = s.indexOf("\n", i);
+      i = (nl === -1 ? s.length : nl) - 1;
+    } else if (s.startsWith("<<<", i)) {
+      endWord();
+      i += 2;
+    } else if (s.startsWith("$((", i) || c === "(" && s[i + 1] === "(" && !inWord) {
+      const end = s.indexOf("))", i + 2);
+      const stop = end === -1 ? s.length : end + 2;
+      if (c === "(") endCommand();
+      word += s.slice(i, stop);
+      inWord = true;
+      if (c === "(") endCommand();
+      i = stop - 1;
+    } else if (c === "<" && s.startsWith("<<", i)) {
+      const tabs = s[i + 2] === "-";
+      const d = heredocWord(s, i + (tabs ? 3 : 2));
+      if (d) {
+        endWord();
+        heredocs.push({ delim: d.word, tabs });
+        i = d.end - 1;
+      } else {
+        word += c;
+        inWord = true;
+      }
+    } else if (c === "\n") {
+      endCommand();
+      let j = i + 1;
+      while (heredocs.length) {
+        const { delim, tabs } = heredocs.shift();
+        while (j < s.length) {
+          const nl = s.indexOf("\n", j);
+          const end = nl === -1 ? s.length : nl;
+          const line = s.slice(j, end);
+          j = end + 1;
+          if ((tabs ? line.replace(/^\t+/, "") : line) === delim) break;
+        }
+      }
+      i = Math.min(j, s.length) - 1;
+    } else if (c === " " || c === "	" || c === "\r") {
+      endWord();
+    } else if (";&|()".includes(c)) {
+      endCommand();
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  endCommand();
+  return commands;
+}
+function heredocWord(s, from) {
+  let i = from;
+  while (s[i] === " " || s[i] === "	") i += 1;
+  let word = "";
+  let present = false;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'" || c === '"') {
+      const end = s.indexOf(c, i + 1);
+      if (end === -1) return null;
+      word += s.slice(i + 1, end);
+      present = true;
+      i = end;
+    } else if (c === "\\" && i + 1 < s.length && s[i + 1] !== "\n") {
+      word += s[i + 1];
+      present = true;
+      i += 1;
+    } else if (/[\s;&|()<>]/.test(c)) {
+      break;
+    } else {
+      word += c;
+      present = true;
+    }
+  }
+  return present ? { word, end: i } : null;
+}
+var WRAPPERS = new Map([
+  ["sudo", ["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type", "--command-timeout", "--other-user"]],
+  ["env", ["-u", "-C", "--unset", "--chdir"]],
+  ["nice", ["-n", "--adjustment"]],
+  ["time", ["-f", "-o", "--format", "--output"]],
+  ["exec", ["-a"]],
+  ["command", []],
+  ["npx", ["-p", "--package"]],
+  ["pnpx", []],
+  ["bunx", ["-p", "--package"]],
+  ["uvx", ["-p", "--python", "--from", "--with", "--with-editable", "--with-requirements", "-c", "--constraints", "--index", "--default-index", "--index-url", "--extra-index-url", "-f", "--find-links", "--directory", "--project", "--config-file", "--cache-dir"]]
+].map(([name, valued]) => [name, new Set(valued)]));
+var OPENERS = /* @__PURE__ */ new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
+var LOOKUPS = /* @__PURE__ */ new Map([["command", /* @__PURE__ */ new Set(["-v", "-V"])]]);
+function programWords(words) {
+  let k = 0;
+  while (k < words.length && OPENERS.has(words[k])) k += 1;
+  let wrapper = null;
+  let lookups = null;
+  while (k < words.length) {
+    const w = words[k];
+    if (WRAPPERS.has(w)) {
+      wrapper = WRAPPERS.get(w);
+      lookups = LOOKUPS.get(w) || null;
+    } else if (lookups && lookups.has(w)) {
+      return [];
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+    } else if (wrapper && w === "--") {
+      k += 1;
+      break;
+    } else if (wrapper && w.startsWith("-")) {
+      if (wrapper.has(w)) k += 1;
+    } else {
+      break;
+    }
+    k += 1;
+  }
+  const rest = words.slice(k);
+  if (rest.length) rest[0] = rest[0].split("/").pop();
+  return rest;
 }
 function installersOf(runs, steps = []) {
   const uses = steps.map((st) => String(st.uses || "")).join("\n");
@@ -8790,24 +8960,42 @@ function scanWorkflow(text) {
 }
 var list = (xs, n = 5) => `${xs.slice(0, n).join("; ")}${xs.length > n ? ` and ${xs.length - n} more` : ""}`;
 var where = (paths) => paths.length === 1 ? paths[0] : `${paths.length} workflow files: ${list(paths, 4)}`;
-function scanFindings(files) {
+function scanFindings(files, { repo = null } = {}) {
   const scans = [...files].map(([path, text]) => ({ path, ...scanWorkflow(text) })).filter((s) => s.parsed);
   const F = [];
   const unpinned = scans.flatMap((s) => s.unpinned.map((u) => ({ ...u, path: s.path })));
   if (unpinned.length) {
-    const third = unpinned.filter((u) => !u.firstParty);
+    const [owner, name] = String(repo || "").toLowerCase().split("/");
+    const whose = (u) => {
+      const [o, r] = u.uses.toLowerCase().split("@")[0].split("/");
+      if (owner && o === owner && r === name && u.step === void 0) return "self";
+      if (owner && o === owner) return "owner";
+      return u.firstParty ? "github" : "third";
+    };
+    const by = { third: [], github: [], owner: [], self: [] };
+    for (const u of unpinned) by[whose(u)].push(u);
     const unique = (xs) => [...new Set(xs.map((u) => u.uses))];
+    const refs = (xs, n = 5) => list(unique(xs), n).split("; ").join(", ");
     const paths = [...new Set(unpinned.map((u) => u.path))];
+    const parts = [];
+    if (by.third.length) parts.push(`third-party: ${refs(by.third)}`);
+    if (by.owner.length) parts.push(`owned by ${owner}: ${refs(by.owner, 3)}`);
+    if (by.github.length) parts.push(`GitHub's own: ${refs(by.github, 3)}`);
+    if (by.self.length) parts.push(`this repository's own reusable workflow${by.self.length === 1 ? "" : "s"}, at a branch or tag (called locally, ./.github/workflows/..., it runs from the caller's commit and needs no pin): ${refs(by.self, 3)}`);
+    const first = by.third[0] || by.owner[0] || by.github[0] || by.self[0];
+    const [ref, tag] = first.uses.split("@");
+    const localPath = whose(first) === "self" ? ref.split("/").slice(2).join("/") : null;
     F.push({
       saving: 0,
       unit: "risk",
       confidence: "confirmed",
       what: "actions not pinned to a commit",
       workflow: where(paths),
-      evidence: `${unpinned.length} action reference${unpinned.length === 1 ? "" : "s"} ${unpinned.length === 1 ? "is" : "are"} pinned to a tag or branch, which its owner (or anyone who takes over the repository) can move to other code` + (third.length ? `; third-party: ${list(unique(third))}` : "; all are GitHub's own actions") + (unpinned.length > third.length ? `${third.length ? "; GitHub's own" : ""}: ${list(unique(unpinned.filter((u) => u.firstParty)), 3)}` : ""),
-      fix: "pin each to the full 40-character commit SHA of the release it means, with the tag in a comment, and let Dependabot or Renovate propose new pins as releases come",
+      evidence: `${unpinned.length} action reference${unpinned.length === 1 ? "" : "s"} ${unpinned.length === 1 ? "is" : "are"} pinned to a tag or branch, which can be moved to other code by whoever controls that repository; ${parts.join("; ")}`,
+      fix: "pin each to the full 40-character commit SHA of the release it means, with the tag in a comment, and let Dependabot or Renovate propose new pins as releases come" + (by.self.length ? "; call this repository's own reusable workflows locally (uses: ./.github/workflows/...), which GitHub runs from the caller's commit" : ""),
       tradeoff: "a new release becomes a pull request to review instead of arriving silently with a moved tag",
-      example: `- uses: ${(third[0] || unpinned[0]).uses.split("@")[0]}@<full 40-character commit SHA>  # ${(third[0] || unpinned[0]).uses.split("@")[1]}`
+      // A reusable workflow is called by a job (`uses:` under the job), not by a step.
+      example: localPath ? `uses: ./${localPath}   # runs from the caller's commit, nothing to pin` : `- uses: ${ref}@<full 40-character commit SHA>  # ${tag}`
     });
   }
   const injections = scans.flatMap((s) => s.injections.map((x) => ({ ...x, path: s.path })));
@@ -8850,6 +9038,59 @@ function scanFindings(files) {
 var ACTIONS_APP = 15368;
 var isActionsCheck = (c) => c.integrationId === ACTIONS_APP;
 var PR_TRIGGERS = /* @__PURE__ */ new Set(["pull_request", "pull_request_target", "merge_group"]);
+var CODE_SCANNERS = /^(github\/codeql-action\/(init|analyze)|returntocorp\/semgrep-action|semgrep\/semgrep-action|snyk\/actions\/(?!setup@)|sonarsource\/(sonarcloud-github-action|sonarqube-scan-action|sonarcloud-github-c-cpp|sonarqube-github-c-cpp)|bearer\/bearer-action)/i;
+var SCANNER_IMAGES = /* @__PURE__ */ new Set(["semgrep", "snyk", "sonar-scanner-cli", "bearer"]);
+var imageName = (image) => String(image || "").trim().toLowerCase().replace(/^docker:\/\//, "").split("/").pop().split(/[:@]/)[0];
+var SCAN_COMMAND = /^(semgrep (ci|scan)|snyk code test|codeql database (create|analyze)|bearer scan)( |$)/;
+var NOT_CODE_TOOLS = /* @__PURE__ */ new Set(["scorecard", "scorecard-action", "zizmor", "actionlint", "poutine"]);
+var CONTAINER_VALUED = ["-e", "--env", "--env-file", "-v", "--volume", "--mount", "-w", "--workdir", "--name", "-u", "--user", "-p", "--publish", "--network", "--net", "--entrypoint", "-l", "--label", "--platform", "--pull", "-h", "--hostname", "--add-host", "--device", "--cap-add", "--cap-drop", "--security-opt", "--tmpfs", "--ulimit", "--restart", "--log-driver", "--log-opt", "--gpus", "--ipc", "--pid", "--runtime", "--shm-size", "--stop-signal", "--cpus", "-m", "--memory", "--group-add", "--cidfile", "--dns", "--expose", "--link", "--userns", "--uts", "--volumes-from"];
+var RUNNERS = /* @__PURE__ */ new Map([
+  ["go", { global: /* @__PURE__ */ new Set(["-C"]), valued: /* @__PURE__ */ new Set(["-C", "-o", "-p", "-tags", "-ldflags", "-gcflags", "-asmflags", "-mod", "-modfile", "-overlay", "-pkgdir", "-toolexec", "-exec"]), container: false }],
+  ["pipx", { global: /* @__PURE__ */ new Set(), valued: /* @__PURE__ */ new Set(["--spec", "--python", "--index-url", "--pip-args"]), container: false }],
+  ["docker", { global: /* @__PURE__ */ new Set(["-c", "--context", "-H", "--host", "--config", "-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey"]), valued: new Set(CONTAINER_VALUED), container: true }],
+  ["podman", { global: /* @__PURE__ */ new Set(["-c", "--connection", "--url", "--identity", "--root", "--runroot", "--log-level", "--storage-driver", "--cgroup-manager"]), valued: new Set(CONTAINER_VALUED), container: true }]
+]);
+function operandAt(args, from, valued) {
+  for (let i = from; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") return i + 1 < args.length ? i + 1 : -1;
+    if (!a.startsWith("-") || a === "-") return i;
+    if (valued.has(a)) i += 1;
+  }
+  return -1;
+}
+function runTargets(program, args) {
+  const runner = RUNNERS.get(program);
+  if (!runner) return [];
+  let at = operandAt(args, 0, runner.global);
+  if (runner.container && args[at] === "container") at = operandAt(args, at + 1, /* @__PURE__ */ new Set());
+  if (at === -1 || args[at] !== "run") return [];
+  if (!runner.container) {
+    const target2 = operandAt(args, at + 1, runner.valued);
+    return target2 === -1 ? [] : [args[target2]];
+  }
+  let entrypoint = null;
+  let target = -1;
+  for (let i = at + 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      if (i + 1 < args.length) target = i + 1;
+      break;
+    }
+    if (!a.startsWith("-") || a === "-") {
+      target = i;
+      break;
+    }
+    if (a === "--entrypoint") entrypoint = args[i + 1] ?? "";
+    else if (a.startsWith("--entrypoint=")) entrypoint = a.slice("--entrypoint=".length);
+    if (runner.valued.has(a)) i += 1;
+  }
+  if (target === -1) return [];
+  const next = args[target + 1];
+  if (entrypoint === "") return next === void 0 ? [] : [next];
+  if (entrypoint !== null) return [entrypoint];
+  return [args[target], ...next !== void 0 && !next.startsWith("-") ? [next] : []];
+}
 var GATE_LIKE = /\b(test|tests|lint|build|check|checks|verify|analy[sz]e|codeql|typecheck|types|dist|unit|e2e|ci|fuzz|fuzzing)\b/i;
 var list2 = (xs, n = 6) => `${xs.slice(0, n).join(", ")}${xs.length > n ? ` and ${xs.length - n} more` : ""}`;
 function fileFacts(scanFiles) {
@@ -8859,7 +9100,16 @@ function fileFacts(scanFiles) {
     const doc = parseWorkflow(text);
     if (!Object.keys(doc).length) continue;
     if (triggersOf(doc).some((t) => PR_TRIGGERS.has(t))) onPr.push(path);
-    if (allSteps(doc).some((st) => /^github\/codeql-action\/(init|analyze)@/i.test(String(st.uses || "").trim()))) codeql = true;
+    for (const job of Object.values(doc.jobs || {})) {
+      if (!job || typeof job !== "object") continue;
+      const steps = Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
+      const uses = steps.map((st) => String(st.uses || "").trim().toLowerCase());
+      const runs = steps.map((st) => String(st.run || ""));
+      const images = [job.container && typeof job.container === "object" ? job.container.image : job.container, ...uses.filter((u) => u.startsWith("docker://"))];
+      const commands = runs.flatMap((r) => shellCommands(r)).map(programWords).filter((c) => c.length);
+      const notCode = uses.some((u) => /^(ossf\/scorecard-action|zizmorcore\/|woodruffw\/zizmor|rhysd\/actionlint|raven-actions\/actionlint|boostsecurityio\/poutine)/.test(u)) || images.some((i) => NOT_CODE_TOOLS.has(imageName(i))) || commands.some(([program, ...args]) => NOT_CODE_TOOLS.has(program.toLowerCase()) || runTargets(program, args).some((a) => NOT_CODE_TOOLS.has(imageName(a))));
+      if (uses.some((u) => CODE_SCANNERS.test(u)) || !notCode && uses.some((u) => u.startsWith("github/codeql-action/upload-sarif@")) || images.some((i) => SCANNER_IMAGES.has(imageName(i))) || commands.some((c) => SCAN_COMMAND.test(c.join(" ")))) codeql = true;
+    }
   }
   return { onPr, codeql };
 }
@@ -8947,7 +9197,7 @@ function gateFindings(gates, { scanFiles = /* @__PURE__ */ new Map(), scanned = 
       confidence: "inferred",
       what: "no code scanning",
       workflow: "all workflows",
-      evidence: `no workflow file runs github/codeql-action and no code scanning run is in the window, so pull requests are not scanned for vulnerabilities in the code${paid ? "; on a private repository this needs GitHub Advanced Security (or Code Security)" : ""}`,
+      evidence: `no workflow file runs a code scanner (CodeQL, Semgrep, Snyk, a SonarSource scan, Bearer, or a SARIF upload) and no code scanning default-setup run is in the window, so pull requests are not scanned for vulnerabilities in the code${paid ? "; CodeQL on a private repository needs GitHub Advanced Security (or Code Security)" : ""}`,
       fix: "turn on CodeQL default setup (Settings, Code security, Code scanning), or add a CodeQL workflow, and require its analyze check",
       tradeoff: "each push and pull request runs an analysis (minutes for most repositories); findings need triage",
       example: ""
@@ -9660,6 +9910,9 @@ function groupFindings(F) {
   return out.sort((a, b) => risk(b) - risk(a) || b.saving - a.saving);
 }
 function analyse(repo, data) {
+  return withParseCache(() => analyseParsed(repo, data));
+}
+function analyseParsed(repo, data) {
   const week = 7 / data.coveredDays;
   const hasLock = data.lockfiles.length > 0;
   const lockKey = hasLock ? `keyed on ${data.lockfiles[0]}` : "keyed on package.json (the repository commits no lockfile, so the key must come from the manifest)";
@@ -9671,7 +9924,7 @@ function analyse(repo, data) {
     workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week, repo, data.outcomeSamples && data.outcomeSamples.get(wf) || {}));
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
-  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map()), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
+  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map(), { repo }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
   const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",

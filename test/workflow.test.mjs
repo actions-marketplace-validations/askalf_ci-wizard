@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { allSteps, category, categoryOf, concurrencyGroupOf, parseWorkflow, pushBranchesOf, stepCommands, triggersOf, workflowFacts } from '../src/workflow.mjs';
+import { allSteps, category, categoryOf, concurrencyGroupOf, parseWorkflow, programWords, pushBranchesOf, shellCommands, stepCommands, triggersOf, withParseCache, workflowFacts } from '../src/workflow.mjs';
 
 const WF = `name: CI
 on:
@@ -75,4 +75,61 @@ test('a job whose steps are not a list has no steps, and does not stop the rest 
 
 test('a file whose top level is a list or a scalar is not a workflow, and yields no facts', () => {
   for (const text of ['[]', '- a\n- b', 'just text', '3']) assert.deepEqual(parseWorkflow(text), {}, text);
+});
+
+test('an audit parses each distinct file once, however many, and keeps nothing after it', () => {
+  const texts = Array.from({ length: 600 }, (_, i) => `on: push\njobs:\n  j${i}:\n    runs-on: ubuntu-latest\n`);
+  withParseCache(() => {
+    const first = texts.map((t) => parseWorkflow(t));
+    const again = texts.map((t) => parseWorkflow(t));
+    assert.ok(first.every((d, i) => d === again[i]), 'every file is parsed once in the audit, past 512 files');
+    assert.equal(withParseCache(() => parseWorkflow(texts[0])), first[0], 'a nested audit shares the cache');
+  });
+  assert.notEqual(parseWorkflow(texts[0]), parseWorkflow(texts[0]), 'outside an audit nothing is kept');
+});
+
+test('shell commands: split outside quotes, without comments or here-document bodies', () => {
+  assert.deepEqual(shellCommands('echo "a; b" && make test | tee log # make deploy\nnpm ci'), [['echo', 'a; b'], ['make', 'test'], ['tee', 'log'], ['npm', 'ci']]);
+  assert.deepEqual(shellCommands("cat <<-'EOF' > f\n\tsemgrep ci\n\tEOF\nmake"), [['cat', '>', 'f'], ['make']]);
+  assert.deepEqual(shellCommands('codeql database create \\\n  db'), [['codeql', 'database', 'create', 'db']]);
+  assert.deepEqual(shellCommands('x=$(semgrep scan)'), [['x=$'], ['semgrep', 'scan']]);
+  assert.deepEqual(shellCommands('echo "unterminated'), [['echo', 'unterminated']]);
+  assert.deepEqual(programWords(['FOO=1', 'sudo', '-E', '/usr/bin/semgrep', 'ci']), ['semgrep', 'ci']);
+  assert.deepEqual(programWords(['make', '-j4']), ['make', '-j4']);
+  // A wrapper's option that takes a value takes the next word with it; --opt=value carries its own.
+  assert.deepEqual(programWords(['sudo', '-u', 'root', 'semgrep', 'ci']), ['semgrep', 'ci']);
+  assert.deepEqual(programWords(['sudo', '--user=root', '-E', 'semgrep', 'ci']), ['semgrep', 'ci']);
+  assert.deepEqual(programWords(['env', '-u', 'TOKEN', 'A=1', 'semgrep', 'ci']), ['semgrep', 'ci']);
+  assert.deepEqual(programWords(['sudo', '-u', 'ci', 'env', '-C', 'app', 'snyk', 'code', 'test']), ['snyk', 'code', 'test']);
+  assert.deepEqual(programWords(['nice', '-n', '10', 'time', '-o', 't.txt', 'bearer', 'scan', '.']), ['bearer', 'scan', '.']);
+  assert.deepEqual(programWords(['npx', '--package', 'snyk', '--', 'snyk', 'code', 'test']), ['snyk', 'code', 'test']);
+  assert.deepEqual(programWords(['uvx', '--from', 'semgrep==1.90', 'semgrep', 'ci']), ['semgrep', 'ci']);
+  assert.deepEqual(programWords(['uvx', '--constraints', 'req.txt', 'zizmor', '.']), ['zizmor', '.']);
+  // command -v and -V look a name up and run nothing; plain command runs it.
+  assert.deepEqual(programWords(['command', '-v', 'semgrep']), []);
+  assert.deepEqual(programWords(['command', '-V', 'actionlint']), []);
+  assert.deepEqual(programWords(['command', '-p', 'semgrep', 'ci']), ['semgrep', 'ci']);
+  // An option outside a wrapper is the command's own.
+  assert.deepEqual(programWords(['grep', '-u', 'semgrep', 'ci']), ['grep', '-u', 'semgrep', 'ci']);
+  assert.deepEqual(programWords(['A=1']), []);
+  // Reserved words that open a compound command are not the program.
+  assert.deepEqual(shellCommands('if true; then semgrep ci; fi').map(programWords), [['true'], ['semgrep', 'ci'], ['fi']]);
+  assert.deepEqual(programWords(['!', 'grep', '-q', 'x']), ['grep', '-q', 'x']);
+  // A here-document ends only at its exact delimiter: trailing space does not end it, and only
+  // <<- strips leading tabs.
+  assert.deepEqual(shellCommands("cat <<'EOF'\nEOF \nsemgrep ci\nEOF\nmake"), [['cat'], ['make']]);
+  assert.deepEqual(shellCommands('cat <<EOF\n\tEOF\nsemgrep ci\nEOF\nmake'), [['cat'], ['make']]);
+  assert.deepEqual(shellCommands('cat <<-EOF\n\tEOF\nmake'), [['cat'], ['make']]);
+  // The delimiter is the whole shell word, quoted punctuation and escapes included.
+  assert.deepEqual(shellCommands("cat <<'END-TEXT'\nsemgrep ci\nEND-TEXT\nmake"), [['cat'], ['make']]);
+  assert.deepEqual(shellCommands('cat <<"a b"\nsemgrep ci\na b\nmake'), [['cat'], ['make']]);
+  assert.deepEqual(shellCommands('cat << E\\OF > f\nsemgrep ci\nEOF\nmake'), [['cat', '>', 'f'], ['make']]);
+  assert.deepEqual(shellCommands('cat <<END.txt\nsemgrep ci\nEND.txt\nmake'), [['cat'], ['make']]);
+  // An empty quoted delimiter: the first empty line ends the here-document.
+  assert.deepEqual(shellCommands("cat <<''\nsemgrep ci\n\nmake"), [['cat'], ['make']]);
+  // A here-string is not a here-document: the next line is a command.
+  assert.deepEqual(shellCommands('cat <<< "hello"\nsemgrep ci'), [['cat', 'hello'], ['semgrep', 'ci']]);
+  // A shift in arithmetic is not a here-document either.
+  assert.deepEqual(shellCommands('x=$((1 << 2))\nsemgrep ci'), [['x=$((1 << 2))'], ['semgrep', 'ci']]);
+  assert.deepEqual(shellCommands('(( n << 1 ))\nsemgrep ci'), [['(( n << 1 ))'], ['semgrep', 'ci']]);
 });

@@ -2,7 +2,7 @@
 // whether pull requests are checked at all, and the two workflows a supply-chain review expects
 // (code scanning, dependency updates). Every finding comes from what the API showed; whatever it
 // could not read (a ruleset, a listing) yields no finding rather than a guess.
-import { allSteps, parseWorkflow, triggersOf } from './workflow.mjs';
+import { parseWorkflow, programWords, shellCommands, triggersOf } from './workflow.mjs';
 
 // GitHub Actions' app id. Only a required check bound to it is known to come from a workflow job,
 // which the runs show. One bound to another app (a coverage service, a review bot), or bound to no
@@ -11,6 +11,94 @@ const ACTIONS_APP = 15368;
 export const isActionsCheck = (c) => c.integrationId === ACTIONS_APP;
 
 const PR_TRIGGERS = new Set(['pull_request', 'pull_request_target', 'merge_group']);
+
+// Actions that scan a repository's code and report its vulnerabilities: CodeQL, Semgrep, Snyk,
+// SonarSource's scan actions (SonarCloud, SonarQube; not its quality-gate action, which only waits
+// for a scan's result), Bearer. snyk/actions/setup only installs the CLI: a scan it runs is a
+// command, counted as one.
+const CODE_SCANNERS = /^(github\/codeql-action\/(init|analyze)|returntocorp\/semgrep-action|semgrep\/semgrep-action|snyk\/actions\/(?!setup@)|sonarsource\/(sonarcloud-github-action|sonarqube-scan-action|sonarcloud-github-c-cpp|sonarqube-github-c-cpp)|bearer\/bearer-action)/i;
+
+// The same scanners' container images, by the image's name without its registry, owner or tag:
+// semgrep/semgrep, snyk/snyk, sonarsource/sonar-scanner-cli, bearer/bearer. A SonarQube server
+// image is not a scan.
+const SCANNER_IMAGES = new Set(['semgrep', 'snyk', 'sonar-scanner-cli', 'bearer']);
+const imageName = (image) => String(image || '').trim().toLowerCase().replace(/^docker:\/\//, '').split('/').pop().split(/[:@]/)[0];
+
+// A scanner run as a command, matched on the command's own words (see shellCommands): text that
+// only mentions one, in a quoted message, a comment or a here-document, is not a run.
+const SCAN_COMMAND = /^(semgrep (ci|scan)|snyk code test|codeql database (create|analyze)|bearer scan)( |$)/;
+
+// Tools whose SARIF is about the repository's settings or its workflows, and the programs that run
+// another program by its path, package or image (go run, pipx run, a container).
+const NOT_CODE_TOOLS = new Set(['scorecard', 'scorecard-action', 'zizmor', 'actionlint', 'poutine']);
+// Runners that fetch and run another program, each with its options that take a value. What runs
+// is the operand of the run subcommand (go run, pipx run, docker or podman run, docker container
+// run), found past the options: `docker run --name actionlint aquasec/trivy` runs Trivy. For a
+// container, the image, its --entrypoint and a command given right after the image say what runs.
+// go install, docker pull and the like run nothing.
+const CONTAINER_VALUED = ['-e', '--env', '--env-file', '-v', '--volume', '--mount', '-w', '--workdir', '--name', '-u', '--user', '-p', '--publish', '--network', '--net', '--entrypoint', '-l', '--label', '--platform', '--pull', '-h', '--hostname', '--add-host', '--device', '--cap-add', '--cap-drop', '--security-opt', '--tmpfs', '--ulimit', '--restart', '--log-driver', '--log-opt', '--gpus', '--ipc', '--pid', '--runtime', '--shm-size', '--stop-signal', '--cpus', '-m', '--memory', '--group-add', '--cidfile', '--dns', '--expose', '--link', '--userns', '--uts', '--volumes-from'];
+// Each runner's global options that take a value, which come before the subcommand
+// (go -C dir run, docker --context ci run), apart from the run subcommand's own.
+const RUNNERS = new Map([
+  ['go', { global: new Set(['-C']), valued: new Set(['-C', '-o', '-p', '-tags', '-ldflags', '-gcflags', '-asmflags', '-mod', '-modfile', '-overlay', '-pkgdir', '-toolexec', '-exec']), container: false }],
+  ['pipx', { global: new Set(), valued: new Set(['--spec', '--python', '--index-url', '--pip-args']), container: false }],
+  ['docker', { global: new Set(['-c', '--context', '-H', '--host', '--config', '-l', '--log-level', '--tlscacert', '--tlscert', '--tlskey']), valued: new Set(CONTAINER_VALUED), container: true }],
+  ['podman', { global: new Set(['-c', '--connection', '--url', '--identity', '--root', '--runroot', '--log-level', '--storage-driver', '--cgroup-manager']), valued: new Set(CONTAINER_VALUED), container: true }],
+]);
+
+/** The index of the first operand in args from `from`, past options and their values; -1 if none. */
+function operandAt(args, from, valued) {
+  for (let i = from; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') return i + 1 < args.length ? i + 1 : -1;
+    if (!a.startsWith('-') || a === '-') return i;
+    if (valued.has(a)) i += 1; // the option's value is the next word; --name=x carries its own
+  }
+  return -1;
+}
+
+/** What a runner command runs (its program, package or image, and a container's command), or none. */
+function runTargets(program, args) {
+  const runner = RUNNERS.get(program);
+  if (!runner) return [];
+  // The subcommand: the first operand past the global options (docker container run: the second).
+  let at = operandAt(args, 0, runner.global);
+  if (runner.container && args[at] === 'container') at = operandAt(args, at + 1, new Set());
+  if (at === -1 || args[at] !== 'run') return [];
+  if (!runner.container) {
+    const target = operandAt(args, at + 1, runner.valued);
+    return target === -1 ? [] : [args[target]];
+  }
+  // A container runs its entrypoint with the words after the image. An --entrypoint given replaces
+  // the image's own, so it alone is what runs, and the words after the image are its arguments.
+  // Otherwise the image runs, with the word right after it as its command when that is not an
+  // option (an option there, and everything after it, is the image's entrypoint's).
+  // The last --entrypoint given wins; null when none is. An empty one ('') clears the image's
+  // entrypoint, so the first word after the image is the program that runs.
+  // Read in the same pass that skips each option's value, so a value (--label --entrypoint=echo)
+  // is never read as an option.
+  let entrypoint = null;
+  let target = -1;
+  for (let i = at + 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') {
+      if (i + 1 < args.length) target = i + 1;
+      break;
+    }
+    if (!a.startsWith('-') || a === '-') {
+      target = i;
+      break;
+    }
+    if (a === '--entrypoint') entrypoint = args[i + 1] ?? '';
+    else if (a.startsWith('--entrypoint=')) entrypoint = a.slice('--entrypoint='.length);
+    if (runner.valued.has(a)) i += 1; // the option's value is the next word; --name=x carries its own
+  }
+  if (target === -1) return [];
+  const next = args[target + 1];
+  if (entrypoint === '') return next === undefined ? [] : [next];
+  if (entrypoint !== null) return [entrypoint];
+  return [args[target], ...(next !== undefined && !next.startsWith('-') ? [next] : [])];
+}
 
 // Checks that test, build or analyse the change: the ones a merge should wait for. Matched on the
 // check's name, so the finding says "inferred" and lists the rest apart.
@@ -26,9 +114,30 @@ function fileFacts(scanFiles) {
     const doc = parseWorkflow(text);
     if (!Object.keys(doc).length) continue;
     if (triggersOf(doc).some((t) => PR_TRIGGERS.has(t))) onPr.push(path);
-    // A step that runs CodeQL, read from the parsed steps: a commented-out line or a script that
-    // mentions it is not one.
-    if (allSteps(doc).some((st) => /^github\/codeql-action\/(init|analyze)@/i.test(String(st.uses || '').trim()))) codeql = true;
+    // A step that scans the code, read from the parsed steps (a commented-out line or a script that
+    // only mentions one is not one): CodeQL, or another code scanner by its action, its container
+    // or its command. A SARIF upload counts when its job is not a Scorecard or workflow-linter run,
+    // whose results are about the repository's settings or workflows, not its code.
+    for (const job of Object.values(doc.jobs || {})) {
+      if (!job || typeof job !== 'object') continue;
+      const steps = Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === 'object') : [];
+      const uses = steps.map((st) => String(st.uses || '').trim().toLowerCase());
+      const runs = steps.map((st) => String(st.run || ''));
+      // The job's container, and any step that runs an image (uses: docker://...).
+      const images = [job.container && typeof job.container === 'object' ? job.container.image : job.container, ...uses.filter((u) => u.startsWith('docker://'))];
+      const commands = runs.flatMap((r) => shellCommands(r)).map(programWords).filter((c) => c.length);
+      // A job that runs Scorecard or a workflow linter (by action, by its image as the job's
+      // container or a docker:// step, or by a command that runs one, directly or through go run
+      // or a container) uploads results about settings or workflows, not about the code.
+      const notCode = uses.some((u) => /^(ossf\/scorecard-action|zizmorcore\/|woodruffw\/zizmor|rhysd\/actionlint|raven-actions\/actionlint|boostsecurityio\/poutine)/.test(u))
+        || images.some((i) => NOT_CODE_TOOLS.has(imageName(i)))
+        || commands.some(([program, ...args]) => NOT_CODE_TOOLS.has(program.toLowerCase())
+          || runTargets(program, args).some((a) => NOT_CODE_TOOLS.has(imageName(a))));
+      if (uses.some((u) => CODE_SCANNERS.test(u))
+        || (!notCode && uses.some((u) => u.startsWith('github/codeql-action/upload-sarif@')))
+        || images.some((i) => SCANNER_IMAGES.has(imageName(i)))
+        || commands.some((c) => SCAN_COMMAND.test(c.join(' ')))) codeql = true;
+    }
   }
   return { onPr, codeql };
 }
@@ -114,7 +223,7 @@ export function gateFindings(gates, { scanFiles = new Map(), scanned = null, vis
     const paid = visibility && visibility !== 'public';
     F.push({
       saving: 0, unit: 'risk', confidence: 'inferred', what: 'no code scanning', workflow: 'all workflows',
-      evidence: `no workflow file runs github/codeql-action and no code scanning run is in the window, so pull requests are not scanned for vulnerabilities in the code${paid ? '; on a private repository this needs GitHub Advanced Security (or Code Security)' : ''}`,
+      evidence: `no workflow file runs a code scanner (CodeQL, Semgrep, Snyk, a SonarSource scan, Bearer, or a SARIF upload) and no code scanning default-setup run is in the window, so pull requests are not scanned for vulnerabilities in the code${paid ? '; CodeQL on a private repository needs GitHub Advanced Security (or Code Security)' : ''}`,
       fix: 'turn on CodeQL default setup (Settings, Code security, Code scanning), or add a CodeQL workflow, and require its analyze check',
       tradeoff: 'each push and pull request runs an analysis (minutes for most repositories); findings need triage',
       example: '',

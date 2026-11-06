@@ -284,7 +284,12 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
   takes over the repository. Local actions (`./`) and Docker images are not references. One finding
   for the repository; the evidence separates third-party actions from GitHub's own (`actions/`,
   `github/`).
-- **Confidence** confirmed. A risk, ranked first.
+- **Confidence** confirmed. A risk, ranked first. The evidence says who can move each reference:
+  a third party, the repository's owner, GitHub (`actions/`, `github/`), or the repository itself.
+  The repository's own reusable workflow called at a branch or tag is better called locally
+  (`uses: ./.github/workflows/...`): GitHub runs a local reusable workflow from the caller's
+  commit, so it needs no pin. The repository's own step action is counted with the owner's and
+  pinned: a local action runs from whatever the job checked out, and needs a checkout first.
 - **Fix** the full commit SHA of the release, with the tag in a comment, and Dependabot or Renovate
   to propose new pins. *Trade-off:* a new release becomes a pull request to review instead of
   arriving with a moved tag.
@@ -392,10 +397,41 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 
 ## no code scanning
 
-- **Fires when** every workflow file was read, no step's `uses:` is `github/codeql-action/init` or
-  `/analyze` (a commented-out step or a script that mentions it does not count), and no code
-  scanning default-setup run (`dynamic/github-code-scanning`) is in the window. On a private
-  repository the evidence notes that code scanning needs GitHub Advanced Security.
+- **Fires when** every workflow file was read, no job runs a code scanner, and no code
+  scanning default-setup run (`dynamic/github-code-scanning`) is in the window. A code scanner is,
+  read from the parsed steps (a commented-out step does not count):
+  - CodeQL (`github/codeql-action/init` or `/analyze`);
+  - Semgrep, Snyk, SonarSource or Bearer, by their action, their container image, or their
+    command:
+    - actions: `semgrep/semgrep-action`, `snyk/actions/*` except `setup` (which only installs
+      the CLI), SonarSource's scan actions (not its quality-gate action, which only waits for a
+      scan's result), `bearer/bearer-action`;
+    - images, matched by name as the job's container or a `docker://` step: `semgrep/semgrep`,
+      `snyk/snyk`, `sonarsource/sonar-scanner-cli`, `bearer/bearer` (not a SonarQube server
+      image);
+    - commands: `semgrep ci`/`semgrep scan`, `snyk code test`, `bearer scan`,
+      `codeql database create`/`analyze`;
+  - a SARIF upload (`github/codeql-action/upload-sarif`), unless its job runs Scorecard or a
+    workflow linter (zizmor, actionlint, poutine), whose results are about settings or workflows,
+    not the code. The linter is recognised by its action, its image (as above), or a command that
+    runs it.
+
+  A command is read from the script's own commands, not its text. The script is split into
+  commands outside quotes, without comments or here-document bodies. A command's program is
+  found past `if`/`then`/`do`, assignments, and wrappers (`sudo`, `env`, `npx`, `uvx` and
+  others) with their options and option values. For `go run`, `pipx run` and `docker run` (or
+  `podman run`), what runs is the program, package or image past the runner's options. For a
+  container, an `--entrypoint` replaces the image's own (the words after the image are then its
+  arguments), and an empty one clears it (the first word after the image runs); without one, the
+  word right after the image is its command unless it is an option. `command -v` and
+  `command -V` only look a name up, and run nothing.
+  So `echo "run semgrep ci later"`, `docker run --name actionlint aquasec/trivy`,
+  `go install …/actionlint` and `docker pull rhysd/actionlint` run neither a scanner nor a
+  linter, and `sudo -u ci semgrep ci` runs a scanner.
+
+  Each job is judged on its own: a linter's SARIF handed to another job as an artifact and
+  uploaded there counts as code scanning. On a private repository the evidence notes that code
+  scanning needs GitHub Advanced Security.
 - **Confidence** inferred: default setup that has not run in the window, or another scanner, is not
   seen. A risk.
 
