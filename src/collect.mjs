@@ -1,4 +1,4 @@
-import { NotFoundError } from './github.mjs';
+import { NotFoundError, RateLimitError } from './github.mjs';
 
 // Reads what an audit needs from GitHub, read-only: up to 500 workflow runs from the window, the
 // jobs (with their steps) of the newest successful runs of the busiest workflows, those
@@ -7,14 +7,18 @@ import { NotFoundError } from './github.mjs';
 const LOCKFILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'bun.lock', 'poetry.lock', 'uv.lock', 'Pipfile.lock', 'go.sum', 'Cargo.lock', 'Gemfile.lock'];
 
 /**
- * Runs grouped by workflow, labelled by name. A run's `name` is not a stable key: the runs a pull
- * request makes for a workflow it adds (or changes so it fails to load) can carry the pull
- * request's title instead, which split one workflow into two rows. So runs group by workflow_id
- * (then the file path, then the name), and each group is labelled with the name most of its runs
- * carry, ties going to the newest run's. Two workflows that share a name get their path appended.
+ * Runs grouped by workflow, labelled by name. A run's `name` is not a stable key: a workflow with
+ * `run-name:` names each run after its pull request or commit, and the runs a pull request makes for
+ * a workflow it adds (or changes so it fails to load) carry the pull request's title. So runs group
+ * by workflow_id (then the file path, then the name), and each group is labelled with the
+ * workflow's own name from the workflows API where it is known (`names`, workflow_id -> name), else
+ * the name most of its runs carry, ties going to the newest run's. Two workflows that share a name
+ * get their path appended.
+ * @param {object[]} runs
+ * @param {Map<number, string>} [names] each workflow's name, by id, from GET /actions/workflows
  * @returns {Map<string, object[]>} label -> runs, newest first as the API lists them
  */
-export function groupRuns(runs) {
+export function groupRuns(runs, names = new Map()) {
   const groups = new Map();
   for (const r of runs) {
     const key = r.workflow_id != null ? `id:${r.workflow_id}` : r.path ? `path:${String(r.path).split('@')[0]}` : `name:${r.name}`;
@@ -26,7 +30,8 @@ export function groupRuns(runs) {
     for (const r of rs) counts.set(r.name, (counts.get(r.name) || 0) + 1);
     const best = Math.max(...counts.values());
     // rs is newest first, so the first run with the top count names the group on a tie.
-    const name = String(rs.find((r) => counts.get(r.name) === best).name);
+    const known = rs[0].workflow_id != null ? names.get(rs[0].workflow_id) : undefined;
+    const name = typeof known === 'string' && known ? known : String(rs.find((r) => counts.get(r.name) === best).name);
     return { name, path: String(rs[0].path || '').split('@')[0], rs };
   });
   const taken = new Map();
@@ -65,7 +70,27 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   const oldest = Math.min(...runs.map((r) => Date.parse(r.created_at)));
   const coveredDays = truncated ? Math.max(0.25, (now.getTime() - oldest) / 86400e3) : days;
 
-  const byWf = groupRuns(runs);
+  // Each workflow's own name (one call): a run's name can be its pull request's title. Only labels
+  // depend on it, so an answer that cannot be read leaves the run names to label the workflows;
+  // the rate-limit reserve still stops the audit.
+  // The list is paginated: pages are read until every workflow the runs name has its name, or the
+  // list ends (a short page, or as many records as its total_count). Usually that is one call; the
+  // rate-limit reserve bounds the rest.
+  const workflowNames = new Map();
+  const wantedIds = new Set(runs.map((r) => r.workflow_id).filter((id) => id != null));
+  try {
+    for (let page = 1, seen = 0; ; page++) {
+      const listed = await client.get(`repos/${repo}/actions/workflows?per_page=100&page=${page}`);
+      const batch = listed && Array.isArray(listed.workflows) ? listed.workflows : [];
+      seen += batch.length;
+      for (const w of batch) if (w && w.id != null && typeof w.name === 'string') workflowNames.set(w.id, w.name);
+      const total = listed && Number.isFinite(listed.total_count) ? listed.total_count : Infinity;
+      if (batch.length < 100 || seen >= total || [...wantedIds].every((id) => workflowNames.has(id))) break;
+    }
+  } catch (e) {
+    if (e instanceof RateLimitError) throw e;
+  }
+  const byWf = groupRuns(runs, workflowNames);
   // The busiest workflows, sampled from their newest successful completed runs.
   // With `only`, the named workflows (matched by name, ignoring case) instead of the busiest.
   const wanted = only.map((n) => String(n).trim().toLowerCase()).filter(Boolean);
@@ -149,7 +174,7 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   // Standard GitHub-hosted runners are free for public repositories, so billed minutes only cost
   // money on a private or internal one. Null when the metadata cannot be read.
   const visibility = meta && typeof meta.visibility === 'string' ? meta.visibility : meta && typeof meta.private === 'boolean' ? (meta.private ? 'private' : 'public') : null;
-  const root = (await client.get(`repos/${repo}/contents/`)) || [];
+  const root = (await client.get(`repos/${repo}/contents`)) || [];
   const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
   return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };

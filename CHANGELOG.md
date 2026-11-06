@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Found by auditing real repositories:
+
+- A workflow is labelled with its own name from the workflows API. The list is read page by page
+  until every workflow the runs name is found; that is usually one call. A workflow with
+  `run-name:` names each run after its pull request, so the most common run name could be a pull
+  request's title. If the workflows answer can't be read, the run names still label it.
+- The repository root is listed as `contents`, not `contents/`. The trailing slash is not the
+  documented form, and a proxy in front of the API refused it.
+- Behind a proxy, the CLI and the action now use it. Node's fetch ignores `HTTPS_PROXY` unless
+  `NODE_USE_ENV_PROXY=1` is set at start-up, so every call went direct and failed (a 401, or no
+  connection). When a proxy is set, they run themselves again with the switch on (Node 22.21 and
+  later). On an older Node they warn that the proxy is ignored.
+
 Security scans of every workflow file (up to 30, not only the sampled workflows'):
 
 - **actions not pinned to a commit**: a step or reusable-workflow `uses:` on a tag or branch, which

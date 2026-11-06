@@ -7468,7 +7468,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
 
 // src/collect.mjs
 var LOCKFILES = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum", "Cargo.lock", "Gemfile.lock"];
-function groupRuns(runs) {
+function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
   const groups = /* @__PURE__ */ new Map();
   for (const r of runs) {
     const key = r.workflow_id != null ? `id:${r.workflow_id}` : r.path ? `path:${String(r.path).split("@")[0]}` : `name:${r.name}`;
@@ -7479,7 +7479,8 @@ function groupRuns(runs) {
     const counts = /* @__PURE__ */ new Map();
     for (const r of rs) counts.set(r.name, (counts.get(r.name) || 0) + 1);
     const best = Math.max(...counts.values());
-    const name = String(rs.find((r) => counts.get(r.name) === best).name);
+    const known = rs[0].workflow_id != null ? names.get(rs[0].workflow_id) : void 0;
+    const name = typeof known === "string" && known ? known : String(rs.find((r) => counts.get(r.name) === best).name);
     return { name, path: String(rs[0].path || "").split("@")[0], rs };
   });
   const taken = /* @__PURE__ */ new Map();
@@ -7508,7 +7509,21 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   if (!runs.length) return null;
   const oldest = Math.min(...runs.map((r) => Date.parse(r.created_at)));
   const coveredDays = truncated ? Math.max(0.25, (now.getTime() - oldest) / 864e5) : days;
-  const byWf = groupRuns(runs);
+  const workflowNames = /* @__PURE__ */ new Map();
+  const wantedIds = new Set(runs.map((r) => r.workflow_id).filter((id) => id != null));
+  try {
+    for (let page = 1, seen = 0; ; page++) {
+      const listed2 = await client.get(`repos/${repo}/actions/workflows?per_page=100&page=${page}`);
+      const batch = listed2 && Array.isArray(listed2.workflows) ? listed2.workflows : [];
+      seen += batch.length;
+      for (const w of batch) if (w && w.id != null && typeof w.name === "string") workflowNames.set(w.id, w.name);
+      const total = listed2 && Number.isFinite(listed2.total_count) ? listed2.total_count : Infinity;
+      if (batch.length < 100 || seen >= total || [...wantedIds].every((id) => workflowNames.has(id))) break;
+    }
+  } catch (e) {
+    if (e instanceof RateLimitError) throw e;
+  }
+  const byWf = groupRuns(runs, workflowNames);
   const wanted = only.map((n2) => String(n2).trim().toLowerCase()).filter(Boolean);
   const ranked = [...byWf.entries()].sort((a, b) => b[1].length - a[1].length);
   const namesOf = (label, rs) => /* @__PURE__ */ new Set([String(label).toLowerCase(), ...rs.map((r) => String(r.name).toLowerCase())]);
@@ -7570,7 +7585,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   const meta = await client.get(`repos/${repo}`);
   const defaultBranch = meta && typeof meta.default_branch === "string" ? meta.default_branch : null;
   const visibility = meta && typeof meta.visibility === "string" ? meta.visibility : meta && typeof meta.private === "boolean" ? meta.private ? "private" : "public" : null;
-  const root = await client.get(`repos/${repo}/contents/`) || [];
+  const root = await client.get(`repos/${repo}/contents`) || [];
   const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
   return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
@@ -9520,5 +9535,36 @@ No workflow runs in the last ${days} days, so there is nothing to measure yet.
   return 0;
 }
 
+// src/proxy.mjs
+import { spawnSync } from "node:child_process";
+function supportsEnvProxy(version = process.versions.node) {
+  const [major, minor] = String(version).split(".").map(Number);
+  return major >= 24 || major === 22 && minor >= 21;
+}
+function proxyPlan(env = process.env, version = process.versions.node) {
+  const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
+  if (!proxy || env.NODE_USE_ENV_PROXY === "1") return { action: "none" };
+  if (supportsEnvProxy(version)) return { action: "rerun" };
+  return {
+    action: "unsupported",
+    message: `a proxy is set (HTTPS_PROXY), but the fetch in Node ${version} ignores it, so calls to the GitHub API go direct; Node 22.21 or later uses it`
+  };
+}
+function rerunWithEnvProxy({ env = process.env, argv = process.argv, execArgv = process.execArgv, execPath = process.execPath } = {}) {
+  const child = spawnSync(execPath, ["--disable-warning=ExperimentalWarning", "--disable-warning=UNDICI-EHPA", ...execArgv, ...argv.slice(1)], {
+    stdio: "inherit",
+    env: { ...env, NODE_USE_ENV_PROXY: "1" }
+  });
+  if (child.error) throw child.error;
+  return child.status ?? 1;
+}
+
 // src/action.mjs
-process.exitCode = await run();
+var plan = proxyPlan(process.env);
+if (plan.action === "rerun") {
+  process.exitCode = rerunWithEnvProxy();
+} else {
+  if (plan.action === "unsupported") process.stdout.write(`::warning::ci-wizard: ${plan.message}
+`);
+  process.exitCode = await run();
+}
