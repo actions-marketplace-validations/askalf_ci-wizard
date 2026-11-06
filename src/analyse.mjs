@@ -75,6 +75,7 @@ export function timeJobs(sampledRuns, commands) {
   const t = {
     secondsByCategory: {}, workStepSeconds: new Map(), jobSecondsPerRun: [], queueWaits: [], tails: [], heads: [],
     jobLengths: [], stepsPerJob: [], hostedJobs: 0, jobCount: 0, sawCacheStep: false, billedPerRun: [], jobDurations: new Map(),
+    jobHosted: new Map(),
   };
   for (const jobs of sampledRuns) {
     let runSeconds = 0;
@@ -85,6 +86,9 @@ export function timeJobs(sampledRuns, commands) {
       const jobName = String(job.name || '');
       if (!t.jobDurations.has(jobName)) t.jobDurations.set(jobName, []);
       t.jobDurations.get(jobName).push(length);
+      // Each job's own runner: a workflow can mix GitHub's standard runners with larger or
+      // self-hosted ones, and what a job's hung run would bill depends on its own.
+      t.jobHosted.set(jobName, (t.jobHosted.get(jobName) || 0) + (ranOnGitHubHosted(job) ? 1 : 0));
       runSeconds += length;
       t.jobLengths.push(length);
       t.queueWaits.push(secs(job.created_at, job.started_at));
@@ -231,7 +235,9 @@ export function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileTex
     billed_minutes_per_run: billedPerRun,
     billed_minutes_week: round(weekFactor * weekBilled, 1),
     cost_by_outcome: costByOutcome,
-    job_durations: Object.fromEntries([...timing.jobDurations].map(([k, v]) => [k, { runs: v.length, max_s: Math.max(...v), median_s: median(v) }])),
+    // hosted_runs: how many of the job's sampled runs were on GitHub's standard hosted runners, as a
+    // count, so a majority is decided exactly.
+    job_durations: Object.fromEntries([...timing.jobDurations].map(([k, v]) => [k, { runs: v.length, max_s: Math.max(...v), median_s: median(v), hosted_runs: timing.jobHosted.get(k) || 0 }])),
     jobs_sampled: timing.jobCount,
     waited_on: waitedOn,
     wait_p50: pct(timing.queueWaits, 0.5),
@@ -448,12 +454,19 @@ export function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultB
     // Only a limit below the one the job already has is a fix: GitHub stops a job at 360 minutes
     // anyway, so a long job whose safe margin reaches that has nothing to tighten.
     if (suggest >= t.minutes) continue;
-    if (t.isDefault || t.minutes > T.timeoutLoose * Math.max(maxS / 60, 1)) loose.push({ ...t, maxS, sampled, suggest });
+    // billed: a hung run of this job would bill by the minute. That needs the job's own runs to be
+    // mostly on GitHub's standard hosted runners (a report from before per-job runners were kept
+    // falls back to the workflow's share), and a repository not known to be public: on a public
+    // one those runners are free. A larger runner reports its own runner group, so it is never
+    // taken as billed.
+    const hostedRuns = sum(runs.map((n) => durations[n].hosted_runs ?? (w.hosted_share >= 0.5 ? durations[n].runs : 0)));
+    const billed = 2 * hostedRuns > sampled && isPublic !== true;
+    if (t.isDefault || t.minutes > T.timeoutLoose * Math.max(maxS / 60, 1)) loose.push({ ...t, maxS, sampled, suggest, billed });
   }
   if (loose.length) {
     // The parts are kept so groupFindings can merge this finding across workflows into one.
     // thin: how many successful runs timed a thinly sampled workflow, so a merged finding can say so.
-    const part = { workflow: w.workflow, path: w.path, hosted: w.hosted_share >= 0.5, thin: w.thin_sample ? w.sampled_runs : null, loose };
+    const part = { workflow: w.workflow, path: w.path, thin: w.thin_sample ? w.sampled_runs : null, loose };
     const { evidence, example } = timeoutText([part]);
     add(0, 'jobs without a working timeout', evidence, TIMEOUT_FIX,
       { tradeoff: TIMEOUT_TRADEOFF, example, unit: 'guard', parts: [part] });
@@ -572,7 +585,7 @@ const TIMEOUT_TRADEOFF = 'a run slower than the limit (a cold cache, a busy runn
 
 /**
  * The evidence and example for jobs without a working timeout, from one or more workflows' parts
- * ({ workflow, path, hosted, thin, loose }). Across workflows each job is named with its workflow,
+ * ({ workflow, path, thin, loose }); each loose job says whether its hung run would bill (billed). Across workflows each job is named with its workflow,
  * and the example gives each file its own YAML document. The evidence names up to five jobs (six
  * across workflows) and counts the rest; the example sets up to three and names the ones it leaves
  * out in a closing comment. For one workflow, add() appends its thin-sample note; across workflows
@@ -587,7 +600,7 @@ function timeoutText(parts) {
   const thinNote = many
     ? parts.filter((p) => p.thin !== null).map((p) => `; ${p.workflow} was timed from only ${p.thin} successful run${p.thin === 1 ? '' : 's'}`).join('')
     : '';
-  const evidence = `${jobs.length === 1 ? 'job' : `${jobs.length} jobs${where}:`} ${shown}: a hung run holds its runner${parts.every((p) => p.hosted) ? ', billing every minute,' : parts.some((p) => p.hosted) ? ' (a GitHub-hosted one billing every minute)' : ''} for up to ${Math.max(...jobs.map((t) => t.minutes))} minutes before GitHub stops it${thinNote}`;
+  const evidence = `${jobs.length === 1 ? 'job' : `${jobs.length} jobs${where}:`} ${shown}: a hung run holds its runner${jobs.every((t) => t.billed) ? ', billing every minute,' : jobs.some((t) => t.billed) ? ' (on the standard GitHub-hosted ones, billing every minute)' : ''} for up to ${Math.max(...jobs.map((t) => t.minutes))} minutes before GitHub stops it${thinNote}`;
   // Up to three jobs in the example; across workflows, one YAML document per file, headed by its
   // path. The jobs it leaves out are named in a comment, so none is silently dropped.
   const block = (ts) => `jobs:\n${ts.map((t) => `  ${t.id}:\n    timeout-minutes: ${t.suggest}   # ${T.timeoutFactor}x its longest sampled run`).join('\n')}`;
