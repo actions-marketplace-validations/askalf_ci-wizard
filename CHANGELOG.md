@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+Security scans of every workflow file (up to 30, not only the sampled workflows'):
+
+- **actions not pinned to a commit**: a step or reusable-workflow `uses:` on a tag or branch, which
+  can be moved to other code, with third-party and GitHub's own actions told apart. The fix pins
+  the full SHA with the tag in a comment.
+- **untrusted input in a script**: a `run:` script or github-script `script` that interpolates a
+  title, body, comment, commit message or author, or a head branch name, per GitHub's hardening
+  guide. The expression is parsed, so only one whose value carries that text counts: a
+  `contains(...)` test, a comparison, a field that only picks a branch (`title && 'yes' || 'no'`) or a
+  quoted field name does not, and property names match in any case. The example is the
+  pattern on the step it names (the expression in `env:`, the variable read in the step's language),
+  and the fix names what a variable does not fix: a second parser, an option that runs a program,
+  an env file, a dash-led argument.
+- **job token wider than the job**: `permissions: write-all` (confirmed), or no permissions block,
+  leaving the repository's default token (inferred), including a reusable-workflow call that hands
+  the caller's token on. The fix is a read-only default, widened per job.
+- All three are risks, ranked first. The report says how many workflow files the scans read, of how
+  many listed, and names any that could not be read; when the directory cannot be listed it says the
+  total is unknown.
+
 Measurement precision:
 
 - A weekly total is now a count times a mean, never a median: run times are skewed by a few long

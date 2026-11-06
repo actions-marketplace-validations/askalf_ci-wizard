@@ -41,7 +41,7 @@ export function groupRuns(runs) {
  * @param {string} repo owner/name
  * @param {{ days?: number, perWorkflow?: number, perOutcome?: number, workflows?: number, only?: string[], now?: Date, maxPages?: number, onProgress?: (msg: string) => void }} [o]
  */
-export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = new Date(), maxPages = 5, onProgress = () => {} } = {}) {
+export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = new Date(), maxPages = 5, maxScanFiles = 30, onProgress = () => {} } = {}) {
   const since = new Date(now.getTime() - days * 86400e3).toISOString().replace(/\.\d{3}Z$/, 'Z');
   const runs = [];
   let truncated = false;
@@ -108,12 +108,40 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   }
   onProgress('reading workflow files');
   const files = new Map();
+  // What each read returned (null for a file that could not be read), so the scans count a failed
+  // read as unread rather than as an empty file.
+  const fileReads = new Map();
   for (const [, rs] of top) {
     const path = String(rs[0].path || '').split('@')[0];
     if (path.startsWith('.github/workflows/') && !files.has(path)) {
-      files.set(path, (await client.getRaw(`repos/${repo}/contents/${path}`)) || '');
+      const text = await client.getRaw(`repos/${repo}/contents/${path}`);
+      fileReads.set(path, typeof text === 'string' ? text : null);
+      files.set(path, text || '');
     }
   }
+  // The workflow scans read every workflow file, not only the sampled workflows': an attack comes in
+  // through whichever workflow lets it, busy or not. One listing, then each file not read yet, up to
+  // maxScanFiles; `scanned` says how many of how many were read.
+  onProgress('scanning workflow files');
+  const listing = await client.get(`repos/${repo}/contents/.github/workflows`);
+  const workflowPaths = (Array.isArray(listing) ? listing : [])
+    .filter((x) => x && x.type === 'file' && /\.ya?ml$/i.test(String(x.name || '')))
+    .map((x) => `.github/workflows/${x.name}`)
+    .sort();
+  // Only a file that was read counts as scanned: one that came back missing (deleted between the
+  // listing and the read) is counted apart, and without a listing the total is unknown (null).
+  const listed = Array.isArray(listing);
+  const scanFiles = new Map();
+  const unreadable = [];
+  const candidates = listed ? workflowPaths : [...files.keys()];
+  for (const path of candidates) {
+    if (scanFiles.size + unreadable.length >= maxScanFiles) break;
+    const known = fileReads.get(path);
+    const text = known !== undefined ? known : await client.getRaw(`repos/${repo}/contents/${path}`);
+    if (typeof text === 'string') scanFiles.set(path, text);
+    else unreadable.push(path);
+  }
+  const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
   // The default branch, for advice that names it (a push trigger limited to it). Unknown when the
   // token cannot read the repository's metadata; the advice then says to fill it in.
   const meta = await client.get(`repos/${repo}`);
@@ -124,5 +152,5 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   const root = (await client.get(`repos/${repo}/contents/`)) || [];
   const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
-  return { runs, byWf, samples, outcomeSamples, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
+  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
 }

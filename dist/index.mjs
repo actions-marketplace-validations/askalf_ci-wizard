@@ -6351,15 +6351,15 @@ var require_parser = __commonJS({
     var node_process = __require("process");
     var cst = require_cst();
     var lexer = require_lexer();
-    function includesToken(list, type) {
-      for (let i = 0; i < list.length; ++i)
-        if (list[i].type === type)
+    function includesToken(list2, type) {
+      for (let i = 0; i < list2.length; ++i)
+        if (list2[i].type === type)
           return true;
       return false;
     }
-    function findNonEmptyIndex(list) {
-      for (let i = 0; i < list.length; ++i) {
-        switch (list[i].type) {
+    function findNonEmptyIndex(list2) {
+      for (let i = 0; i < list2.length; ++i) {
+        switch (list2[i].type) {
           case "space":
           case "comment":
           case "newline":
@@ -7484,7 +7484,7 @@ function groupRuns(runs) {
   for (const g of labelled) out.set(taken.get(g.name) > 1 && g.path ? `${g.name} (${g.path})` : g.name, g.rs);
   return out;
 }
-async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, onProgress = () => {
+async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, onProgress = () => {
 } } = {}) {
   const since = new Date(now.getTime() - days * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
   const runs = [];
@@ -7513,7 +7513,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   const onlyMissing = wanted.length ? only.filter((n2) => String(n2).trim() && !ranked.some(([label, rs]) => matches(label, rs, n2))) : [];
   const samples = /* @__PURE__ */ new Map();
   const outcomeSamples = /* @__PURE__ */ new Map();
-  const jobsOf = async (r) => {
+  const jobsOf2 = async (r) => {
     const j = await client.get(`repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`);
     return j ? (j.jobs || []).filter((x) => x.started_at && x.completed_at && x.conclusion !== "skipped") : null;
   };
@@ -7523,7 +7523,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     const ok = rs.filter((r) => r.status === "completed" && r.conclusion === "success").slice(0, perWorkflow);
     const jobsPerRun = [];
     for (const r of ok) {
-      const jobs = await jobsOf(r);
+      const jobs = await jobsOf2(r);
       if (jobs) jobsPerRun.push(jobs);
     }
     samples.set(wf, jobsPerRun);
@@ -7531,7 +7531,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     for (const outcome of ["failure", "cancelled", "timed_out"]) {
       const picked = rs.filter((r) => r.status === "completed" && r.conclusion === outcome).slice(0, perOutcome);
       for (const r of picked) {
-        const jobs = await jobsOf(r);
+        const jobs = await jobsOf2(r);
         if (jobs) (byOutcome[outcome] ||= []).push(jobs);
       }
     }
@@ -7539,19 +7539,37 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   }
   onProgress("reading workflow files");
   const files = /* @__PURE__ */ new Map();
+  const fileReads = /* @__PURE__ */ new Map();
   for (const [, rs] of top) {
     const path = String(rs[0].path || "").split("@")[0];
     if (path.startsWith(".github/workflows/") && !files.has(path)) {
-      files.set(path, await client.getRaw(`repos/${repo}/contents/${path}`) || "");
+      const text = await client.getRaw(`repos/${repo}/contents/${path}`);
+      fileReads.set(path, typeof text === "string" ? text : null);
+      files.set(path, text || "");
     }
   }
+  onProgress("scanning workflow files");
+  const listing = await client.get(`repos/${repo}/contents/.github/workflows`);
+  const workflowPaths = (Array.isArray(listing) ? listing : []).filter((x) => x && x.type === "file" && /\.ya?ml$/i.test(String(x.name || ""))).map((x) => `.github/workflows/${x.name}`).sort();
+  const listed = Array.isArray(listing);
+  const scanFiles = /* @__PURE__ */ new Map();
+  const unreadable = [];
+  const candidates = listed ? workflowPaths : [...files.keys()];
+  for (const path of candidates) {
+    if (scanFiles.size + unreadable.length >= maxScanFiles) break;
+    const known = fileReads.get(path);
+    const text = known !== void 0 ? known : await client.getRaw(`repos/${repo}/contents/${path}`);
+    if (typeof text === "string") scanFiles.set(path, text);
+    else unreadable.push(path);
+  }
+  const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
   const meta = await client.get(`repos/${repo}`);
   const defaultBranch = meta && typeof meta.default_branch === "string" ? meta.default_branch : null;
   const visibility = meta && typeof meta.visibility === "string" ? meta.visibility : meta && typeof meta.private === "boolean" ? meta.private ? "private" : "public" : null;
   const root = await client.get(`repos/${repo}/contents/`) || [];
   const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
-  return { runs, byWf, samples, outcomeSamples, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
+  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
 }
 
 // src/workflow.mjs
@@ -7889,32 +7907,58 @@ function evaluate(node, ctx) {
     }
   }
 }
+function expressionSpans(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let i = s.indexOf("${{");
+  while (i >= 0) {
+    let j = i + 3;
+    let quoted = false;
+    for (; j < s.length; j += 1) {
+      if (quoted) {
+        if (s[j] === "'") {
+          if (s[j + 1] === "'") j += 1;
+          else quoted = false;
+        }
+      } else if (s[j] === "'") quoted = true;
+      else if (s[j] === "}" && s[j + 1] === "}") break;
+    }
+    if (j >= s.length) break;
+    out.push({ index: i, end: j + 2, expression: s.slice(i, j + 2), body: s.slice(i + 3, j) });
+    i = s.indexOf("${{", j + 2);
+  }
+  return out;
+}
 function valueOf(field, ctx, { isIf = false } = {}) {
   if (field === void 0) return void 0;
   if (Array.isArray(field)) return field.map((f) => valueOf(f, ctx));
   if (field && typeof field === "object") return Object.fromEntries(Object.entries(field).map(([k, v]) => [k, valueOf(v, ctx)]));
   if (typeof field !== "string") return field;
-  const whole = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(field);
+  const spans = expressionSpans(field);
+  const whole = spans.length === 1 && field.slice(0, spans[0].index).trim() === "" && field.slice(spans[0].end).trim() === "" ? spans[0] : null;
   if (whole || isIf) {
     try {
-      return evaluate(parseExpr(whole ? whole[1] : field), ctx);
+      return evaluate(parseExpr(whole ? whole.body : field), ctx);
     } catch {
       return UNKNOWN;
     }
   }
   if (field.includes("${{")) {
-    let unknown = false;
-    const out = field.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, e) => {
+    if (field.indexOf("${{", spans.length ? spans[spans.length - 1].end : 0) >= 0) return UNKNOWN;
+    let out = "";
+    let at = 0;
+    for (const sp of spans) {
       let v;
       try {
-        v = evaluate(parseExpr(e), ctx);
+        v = evaluate(parseExpr(sp.body), ctx);
       } catch {
         v = UNKNOWN;
       }
-      if (v === UNKNOWN || isOpaque(v) || v && typeof v === "object") unknown = true;
-      return unknown ? "" : String(v ?? "");
-    });
-    return unknown ? UNKNOWN : out;
+      if (v === UNKNOWN || isOpaque(v) || v && typeof v === "object") return UNKNOWN;
+      out += field.slice(at, sp.index) + String(v ?? "");
+      at = sp.end;
+    }
+    return out + field.slice(at);
   }
   return field;
 }
@@ -8258,6 +8302,264 @@ function countBy(items, key) {
     out[k] = (out[k] || 0) + 1;
   }
   return out;
+}
+
+// src/scans.mjs
+var FIRST_PARTY = /* @__PURE__ */ new Set(["actions", "github"]);
+function parseUses(uses) {
+  const s = String(uses ?? "").trim();
+  if (!s || s.startsWith("./") || s.startsWith("../") || s.startsWith("docker://")) return null;
+  const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_./-]+)@(.+)$/.exec(s);
+  if (!m) return null;
+  return { owner: m[1], name: m[2], ref: m[3], pinned: /^[0-9a-f]{40}$/i.test(m[3]), firstParty: FIRST_PARTY.has(m[1].toLowerCase()) };
+}
+var UNTRUSTED = new RegExp([
+  String.raw`github\.event\.(issue|pull_request|discussion)\.(title|body)`,
+  String.raw`github\.event\.(comment|review|review_comment)\.body`,
+  String.raw`github\.event\.pages(\.\*|\[[^\]]*\])\.page_name`,
+  String.raw`github\.event\.commits(\.\*|\[[^\]]*\])\.(message|author\.(email|name))`,
+  String.raw`github\.event\.head_commit\.(message|author\.(email|name))`,
+  String.raw`github\.event\.pull_request\.head\.(ref|label|repo\.default_branch)`,
+  String.raw`github\.event\.workflow_run\.(head_branch|head_commit\.(message|author\.(email|name)))`,
+  String.raw`github\.head_ref`
+].map((p) => `(?:${p})`).join("|"), "i");
+var UNTRUSTED_PATHS = [
+  "github.event.issue.title",
+  "github.event.issue.body",
+  "github.event.pull_request.title",
+  "github.event.pull_request.body",
+  "github.event.discussion.title",
+  "github.event.discussion.body",
+  "github.event.comment.body",
+  "github.event.review.body",
+  "github.event.review_comment.body",
+  "github.event.pages.#.page_name",
+  "github.event.commits.#.message",
+  "github.event.commits.#.author.email",
+  "github.event.commits.#.author.name",
+  "github.event.head_commit.message",
+  "github.event.head_commit.author.email",
+  "github.event.head_commit.author.name",
+  "github.event.pull_request.head.ref",
+  "github.event.pull_request.head.label",
+  "github.event.pull_request.head.repo.default_branch",
+  "github.event.workflow_run.head_branch",
+  "github.event.workflow_run.head_commit.message",
+  "github.event.workflow_run.head_commit.author.email",
+  "github.event.workflow_run.head_commit.author.name",
+  "github.head_ref"
+].map((p) => p.split("."));
+function untrustedPath(path) {
+  const segs = path.split(".");
+  return UNTRUSTED_PATHS.some((u) => segs.length <= u.length && segs.every((seg, i) => seg === "*" || seg === u[i] || u[i] === "#" && /^\d+$/.test(seg)));
+}
+function pathOf(node) {
+  if (node.k === "ctx") return node.path[0];
+  if (node.k === "prop") {
+    const base = pathOf(node.of);
+    return base === null ? null : `${base}.${node.key}`;
+  }
+  if (node.k === "index") {
+    const base = pathOf(node.of);
+    if (base === null) return null;
+    const key = constantKey(node.key);
+    if (typeof key === "string") return `${base}.${key}`;
+    return typeof key === "number" ? `${base}[${key}]` : `${base}[?]`;
+  }
+  return null;
+}
+function constantKey(node) {
+  if (node.k === "lit") return node.v;
+  const readsContext = (n) => n.k === "ctx" || n.of && readsContext(n.of) || n.key && typeof n.key === "object" && readsContext(n.key) || n.args && n.args.some(readsContext) || n.a && readsContext(n.a) || n.b && readsContext(n.b);
+  if (readsContext(node)) return void 0;
+  try {
+    const v = evaluate(node, {});
+    return typeof v === "string" || typeof v === "number" ? v : void 0;
+  } catch {
+    return void 0;
+  }
+}
+var PASSES_TEXT = /* @__PURE__ */ new Set(["format", "join", "tojson", "fromjson"]);
+function flowingFields(node) {
+  switch (node.k) {
+    case "ctx":
+    case "prop":
+    case "index": {
+      const spelled = pathOf(node);
+      if (spelled === null) return node.k === "ctx" ? [] : flowingFields(node.of);
+      const path = spelled.toLowerCase();
+      if (path.includes("[?]")) {
+        const before = path.slice(0, path.indexOf("[?]"));
+        return untrustedPath(before.replace(/\[[^\]]*\]/g, ".*")) ? [before] : [];
+      }
+      const norm = path.replace(/\[[^\]]*\]/g, ".*");
+      return untrustedPath(norm) ? [path] : [];
+    }
+    // a || b gives a when a is truthy, else b: either can be the result. a && b gives a only when a
+    // is falsy, and the only falsy text is the empty string, so only b's text can reach the result:
+    // in `title && 'yes' || 'no'` the title picks a branch and the result is always a literal.
+    case "||":
+      return [...flowingFields(node.a), ...flowingFields(node.b)];
+    case "&&":
+      return flowingFields(node.b);
+    case "call":
+      return PASSES_TEXT.has(node.name) ? node.args.flatMap(flowingFields) : [];
+    default:
+      return [];
+  }
+}
+function untrustedExpressions(script) {
+  const out = [];
+  for (const m of expressionSpans(script)) {
+    let fields;
+    try {
+      fields = flowingFields(parseExpr(m.body));
+    } catch {
+      const hit = UNTRUSTED.exec(m.body);
+      fields = hit ? [hit[0].toLowerCase()] : [];
+    }
+    if (fields.length) out.push({ expression: m.expression, field: fields[0], fields, index: m.index });
+  }
+  return out;
+}
+function envNameFor(field) {
+  const parts = String(field).replace(/\[[^\]]*\]/g, "").split(".").filter((p) => p && p !== "*" && !/^\d+$/.test(p));
+  const last = parts.slice(-2).join("_").replace(/^pull_request_/, "PR_").replace(/^github_/, "");
+  const name = last.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  return /^[A-Z_]/.test(name) ? name : `VALUE${name ? `_${name}` : ""}`;
+}
+function shellLang(shell, runsOn) {
+  if (shell !== void 0 && shell !== null) {
+    const first = String(shell).trim().split(/\s+/)[0].toLowerCase();
+    if (first === "bash" || first === "sh") return "posix";
+    if (first === "pwsh" || first === "powershell") return "pwsh";
+    if (first === "python" || first === "python3") return "python";
+    if (first === "cmd") return "cmd";
+    return null;
+  }
+  const labels = (Array.isArray(runsOn) ? runsOn : typeof runsOn === "string" ? [runsOn] : []).filter((l) => typeof l === "string").map((l) => l.toLowerCase());
+  if (!labels.length || labels.some((l) => l.includes("${{"))) return null;
+  if (labels.some((l) => l.startsWith("windows"))) return "pwsh";
+  if (labels.some((l) => /^(ubuntu|macos|linux)/.test(l))) return "posix";
+  return null;
+}
+function patternExample(x) {
+  const name = envNameFor(x.field);
+  const head = `# the pattern, not a drop-in edit: the expression moves to env, the script reads the variable
+- name: ${JSON.stringify(x.step)}
+  env:
+    ${name}: ${JSON.stringify(x.expression)}
+`;
+  const read = {
+    js: `  with:
+    script: |
+      // read process.env.${name} where the expression was`,
+    pwsh: `  run: |
+    # read $env:${name} where the expression was, e.g. Write-Host $env:${name}`,
+    posix: `  run: |
+    # read "$${name}" (in double quotes) where the expression was, e.g. echo "$${name}"`,
+    python: `  run: |
+    # read os.environ["${name}"] where the expression was (import os)`
+  }[x.lang];
+  if (x.lang === "cmd") return "";
+  if (!read) return `${head}  run: |
+    # read the variable as this step's shell does: "$${name}" in bash, $env:${name} in PowerShell`;
+  return head + read;
+}
+function jobsOf(doc) {
+  return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object");
+}
+function stepsOf(job) {
+  return Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
+}
+function scanWorkflow(text) {
+  const doc = parseWorkflow(text);
+  const unpinned = [];
+  const injections = [];
+  for (const [id, job] of jobsOf(doc)) {
+    const reusable = parseUses(job.uses);
+    if (reusable && !reusable.pinned) unpinned.push({ job: id, uses: String(job.uses), firstParty: reusable.firstParty });
+    stepsOf(job).forEach((st, i) => {
+      const step = st.name ? String(st.name) : st.uses ? String(st.uses) : `step ${i + 1}`;
+      const ref = parseUses(st.uses);
+      if (ref && !ref.pinned) unpinned.push({ job: id, step, uses: String(st.uses), firstParty: ref.firstParty });
+      const scripts = [];
+      if (st.run !== void 0) {
+        const shell = st.shell ?? job.defaults?.run?.shell ?? doc.defaults?.run?.shell;
+        scripts.push({ script: st.run, lang: shellLang(shell, job["runs-on"]) });
+      }
+      const action = parseUses(st.uses);
+      const githubScript = action && action.owner.toLowerCase() === "actions" && action.name.toLowerCase() === "github-script";
+      if (githubScript && st.with && typeof st.with === "object") {
+        scripts.push({ script: st.with.script, lang: "js" });
+      }
+      for (const sc of scripts) {
+        for (const hit of untrustedExpressions(sc.script)) injections.push({ job: id, step, lang: sc.lang, ...hit });
+      }
+    });
+  }
+  const isWriteAll = (p) => typeof p === "string" && p.trim().toLowerCase() === "write-all";
+  const jobs = jobsOf(doc);
+  const writeAll = isWriteAll(doc.permissions) ? ["(workflow)"] : jobs.filter(([, j]) => isWriteAll(j.permissions)).map(([id]) => id);
+  const unscoped = doc.permissions === void 0 ? jobs.filter(([, j]) => j.permissions === void 0).map(([id]) => id) : [];
+  return { unpinned, injections, writeAll, unscoped, parsed: Object.keys(doc).length > 0 };
+}
+var list = (xs, n = 5) => `${xs.slice(0, n).join("; ")}${xs.length > n ? ` and ${xs.length - n} more` : ""}`;
+var where = (paths) => paths.length === 1 ? paths[0] : `${paths.length} workflow files: ${list(paths, 4)}`;
+function scanFindings(files) {
+  const scans = [...files].map(([path, text]) => ({ path, ...scanWorkflow(text) })).filter((s) => s.parsed);
+  const F = [];
+  const unpinned = scans.flatMap((s) => s.unpinned.map((u) => ({ ...u, path: s.path })));
+  if (unpinned.length) {
+    const third = unpinned.filter((u) => !u.firstParty);
+    const unique = (xs) => [...new Set(xs.map((u) => u.uses))];
+    const paths = [...new Set(unpinned.map((u) => u.path))];
+    F.push({
+      saving: 0,
+      unit: "risk",
+      confidence: "confirmed",
+      what: "actions not pinned to a commit",
+      workflow: where(paths),
+      evidence: `${unpinned.length} action reference${unpinned.length === 1 ? "" : "s"} ${unpinned.length === 1 ? "is" : "are"} pinned to a tag or branch, which its owner (or anyone who takes over the repository) can move to other code` + (third.length ? `; third-party: ${list(unique(third))}` : "; all are GitHub's own actions") + (unpinned.length > third.length ? `${third.length ? "; GitHub's own" : ""}: ${list(unique(unpinned.filter((u) => u.firstParty)), 3)}` : ""),
+      fix: "pin each to the full 40-character commit SHA of the release it means, with the tag in a comment, and let Dependabot or Renovate propose new pins as releases come",
+      tradeoff: "a new release becomes a pull request to review instead of arriving silently with a moved tag",
+      example: `- uses: ${(third[0] || unpinned[0]).uses.split("@")[0]}@<full 40-character commit SHA>  # ${(third[0] || unpinned[0]).uses.split("@")[1]}`
+    });
+  }
+  const injections = scans.flatMap((s) => s.injections.map((x) => ({ ...x, path: s.path })));
+  if (injections.length) {
+    F.push({
+      saving: 0,
+      unit: "risk",
+      confidence: "confirmed",
+      what: "untrusted input in a script",
+      workflow: where([...new Set(injections.map((x) => x.path))]),
+      evidence: `${list(injections.map((x) => `${x.path} job ${x.job}, ${x.step}: ${x.expression}`), 4)}; the expression is pasted into the script before it runs, so a title, branch name or comment written as shell code runs as shell code`,
+      fix: 'pass the value through an environment variable and read the variable, quoted, where the expression was ("$VAR" in bash, $env:VAR in PowerShell, process.env.VAR in github-script, os.environ in python), so the shell reads it as data. ' + (injections.some((x) => x.lang === "cmd") ? "cmd expands %VAR% before it parses the line, so a variable is no safer there: run that step in bash or pwsh. " : "") + "The variable is only data while nothing parses it again: not inside a command string (bash -c, eval, ssh, a github-script exec), a program (awk, sed, jq), or an option that runs a program (tar --checkpoint-action, git --upload-pack). Written to $GITHUB_ENV or $GITHUB_OUTPUT, a newline in it sets another variable: write it with a random multiline delimiter (NAME<<DELIM … DELIM). Never write it to $GITHUB_PATH, which takes one path per line and has no delimiter: every line would join PATH. Where it is a command's argument, put -- before it so a leading dash is not read as an option",
+      tradeoff: "none to speak of: the step reads the same value, and only the shell no longer executes it",
+      example: patternExample(injections.find((x) => x.lang !== "cmd") || injections[0])
+    });
+  }
+  const writeAll = scans.filter((s) => s.writeAll.length);
+  const unscoped = scans.filter((s) => s.unscoped.length);
+  if (writeAll.length || unscoped.length) {
+    const confirmed = writeAll.length > 0;
+    const parts = [];
+    if (writeAll.length) parts.push(`write-all in ${list(writeAll.map((s) => `${s.path} (${s.writeAll.join(", ")})`), 4)}`);
+    if (unscoped.length) parts.push(`no permissions block in ${list(unscoped.map((s) => s.path), 4)}, so its jobs get the repository's default token, which is write access on many repositories created before February 2023`);
+    F.push({
+      saving: 0,
+      unit: "risk",
+      confidence: confirmed ? "confirmed" : "inferred",
+      what: "job token wider than the job",
+      workflow: where([...new Set([...writeAll, ...unscoped].map((s) => s.path))]),
+      evidence: `${parts.join("; ")}: a compromised step can use the token to push, release or change settings`,
+      fix: "set a read-only default at the top of each workflow and grant each job only what it uses",
+      tradeoff: "a job that needs more (a release, a comment, a package) must name it, so a missing grant shows as a 403 the first time it runs",
+      example: "permissions:\n  contents: read\njobs:\n  release:\n    permissions:\n      contents: write   # only the job that publishes"
+    });
+  }
+  return F;
 }
 
 // src/advice.mjs
@@ -8943,9 +9245,9 @@ function groupFindings(F) {
   const out = [];
   for (const g of grouped.values()) {
     const wfs = g.workflows;
-    const where = wfs.length === 1 ? wfs[0] : `${wfs.length} workflows: ${wfs.slice(0, 5).join(", ")}${wfs.length > 5 ? " and more" : ""}`;
+    const where2 = wfs.length === 1 ? wfs[0] : `${wfs.length} workflows: ${wfs.slice(0, 5).join(", ")}${wfs.length > 5 ? " and more" : ""}`;
     const evidence = wfs.length === 1 ? g.evidence : `${g.evidence} (shown for the largest; the same holds in the others)`;
-    out.push({ ...g, workflow: where, evidence, workflows: void 0 });
+    out.push({ ...g, workflow: where2, evidence, workflows: void 0 });
   }
   const risk = (f) => f.unit === "risk" ? 1 : 0;
   return out.sort((a, b) => risk(b) - risk(a) || b.saving - a.saving);
@@ -8962,7 +9264,7 @@ function analyse(repo, data) {
     workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week, repo, data.outcomeSamples && data.outcomeSamples.get(wf) || {}));
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
-  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map())];
+  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map())];
   const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",
@@ -8979,6 +9281,9 @@ function analyse(repo, data) {
     covered_days: round(data.coveredDays, 2),
     window_truncated: Boolean(data.truncated),
     visibility: data.visibility || null,
+    // The scans read every workflow file collect listed (scanFiles); an audit built without that
+    // listing (a caller's own data) runs no scans and says so by reporting none read.
+    scanned: data.scanned || { read: (data.scanFiles || /* @__PURE__ */ new Map()).size, of: null, unreadable: [] },
     only: data.only || [],
     only_missing: data.onlyMissing || [],
     runs_total: data.runs.length,
@@ -9124,6 +9429,12 @@ function report(a, { maxFindings = 8 } = {}) {
   L.push('- Billed minutes round each GitHub-hosted job up to a whole minute, as GitHub bills it; a job counts as GitHub-hosted when its runner group is "GitHub Actions".');
   L.push("- Steps grouped into the categories above by the command the workflow file gives each step (its run or uses line) and otherwise by its name.");
   L.push("- Runs whose jobs were all skipped count as runs but cost no job-minutes. Duplicate runs = commits the workflow ran on both a push and a pull request event. Reruns = runs with a run attempt above 1. Outdated runs = a pull request run still going when a newer commit on the same branch started its run.");
+  if (a.scanned && (a.scanned.read || a.scanned.unreadable && a.scanned.unreadable.length)) {
+    const sc = a.scanned;
+    const coverage = sc.of === null || sc.of === void 0 ? `${sc.read} workflow file${sc.read === 1 ? "" : "s"} (the sampled ones; the workflow directory could not be listed, so the total is unknown)` : sc.read === sc.of ? `all ${sc.of} workflow files` : `${sc.read} of the ${sc.of} workflow files`;
+    const missed = sc.unreadable && sc.unreadable.length ? `; ${sc.unreadable.length} could not be read (${sc.unreadable.slice(0, 3).join(", ")}${sc.unreadable.length > 3 ? " and more" : ""})` : "";
+    L.push(`- Security scans (actions pinned to a commit, untrusted input in scripts, the job token) read ${coverage}${missed}, not only the sampled workflows'.`);
+  }
   L.push("- Cache, checkout and concurrency facts are read from the parsed workflow file (actions/cache, a setup action's cache input, the checkout step's inputs, concurrency and cancel-in-progress), so a commented-out line never counts.");
   L.push("- Estimated savings: dependency cache 60% of install time when no cache runs, 30% when one runs but installs still dominate; checkout and toolchain 50%; duplicates, outdated runs and reruns their full job time; self-hosted tail the excess over 2 s; fixed-cost findings half of the fixed share; short hosted jobs half of the billed minutes above the job-minutes. See docs/rules.md in the ci-wizard repository.");
   return `${L.join("\n")}

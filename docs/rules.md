@@ -276,6 +276,67 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
   stays fast. *Trade-off:* every job re-registers, and nothing a job leaves on disk survives for
   the next, so caches go through `actions/cache` or a read-only tool cache.
 
+## actions not pinned to a commit
+
+- **Fires when** a workflow file (every workflow file, not only the sampled ones, up to 30) has a
+  step `uses:` or a reusable-workflow job `uses:` pinned to a tag or branch rather than a full
+  40-character commit SHA. A tag or branch can be moved to other code by its owner, or by anyone who
+  takes over the repository. Local actions (`./`) and Docker images are not references. One finding
+  for the repository; the evidence separates third-party actions from GitHub's own (`actions/`,
+  `github/`).
+- **Confidence** confirmed. A risk, ranked first.
+- **Fix** the full commit SHA of the release, with the tag in a comment, and Dependabot or Renovate
+  to propose new pins. *Trade-off:* a new release becomes a pull request to review instead of
+  arriving with a moved tag.
+
+## untrusted input in a script
+
+- **Fires when** a `run:` script, or actions/github-script's `script` input, interpolates a field an
+  outside contributor writes, per GitHub's security-hardening guide: an issue, pull request or
+  discussion title or body; a comment or review body; a commit message or author; a head branch name
+  or label (`github.head_ref`, `pull_request.head.ref`); a page name. The expression has to carry
+  the text into the script: the field itself, an object that holds it (`toJSON(github.event)`, `toJSON(github.event.commits[0])`), or
+  `format`, `join`, `||` and the right side of `&&` passing it on. A boolean result (`contains(...)`,
+  a comparison, a negation), a field that only picks a branch (`title && 'yes' || 'no'`) and a field
+  name inside a quoted literal are not text from outside. Property names match in any case, as
+  GitHub reads them (`github.event.issue.TITLE` is the title). An expression in
+  `env:` or an `if:` is not a script, and passing the value through `env:` is the fix.
+- **Confidence** confirmed. A risk, ranked first. The evidence names the file, job and step.
+- **Fix** an environment variable for the value, read quoted where the expression was: `"$VAR"`
+  for bash and sh, `$env:VAR` for PowerShell, `process.env.VAR` for github-script. The example is
+  that pattern, labelled as one, on the step it names: the expression in `env:` and the variable in
+  the step's language. It is not a rewrite of the step, since a rewrite that is safe for any script
+  would need a full parser for each language and every command's options. The fix also names what a
+  variable does not fix: a command string or program that parses the value again (`bash -c`,
+  `eval`, `ssh`, a github-script `exec`, `awk`, `sed`, `jq`), an option that runs a program
+  (`tar --checkpoint-action`, `git --upload-pack`), a line written to `$GITHUB_ENV` or
+  `$GITHUB_OUTPUT` (a newline in it sets another variable; write it with a random multiline
+  delimiter), `$GITHUB_PATH` (one path per line and no delimiter, so never write the value there),
+  and an argument that starts with a dash (put `--` before it). A python step reads
+  `os.environ`; a cmd step gets no example, since cmd expands `%VAR%` before it parses the line,
+  and the fix says to run it in bash or pwsh; a step whose shell is unknown (a matrix OS) gets the
+  bash and PowerShell forms, said as such. An expression is followed through computed values too:
+  `fromJSON(toJSON(github.event)).issue.title` carries the title. It ends where GitHub ends it (a
+  `}}` inside a quoted string does not), a key built from constants is resolved
+  (`issue[format('tit{0}', 'le')]` is the title), and a key that reads the run
+  (`issue[inputs.field]`) counts wherever the object can hold untrusted text. Paths are matched
+  segment by segment against each untrusted field, so an object that holds one (`toJSON(github.event)`,
+  `commits[0]`) and an object filter that can select one (`join(github.event.*.title, '')`,
+  `toJSON(github.event.issue.*)`) count, and `github.event.*.number` does not. *Trade-off:* none to
+  speak of: the step reads the same value, and only the shell no longer runs it.
+
+## job token wider than the job
+
+- **Fires when** a workflow or job sets `permissions: write-all` (confirmed), or a workflow has no
+  top-level `permissions:` and a job without its own (inferred: the job gets the repository's
+  default token, which the audit cannot read; write access on many repositories created before
+  February 2023). A job that calls a reusable workflow counts the same way: with no permissions of
+  its own it hands the called workflow the caller's token, which that workflow can narrow but the
+  audit does not read.
+- **Fix** a read-only default at the top of each workflow (`contents: read`) and each job granted
+  only what it uses. *Trade-off:* a job that needs more must name it, so a missing grant shows as a
+  403 the first time it runs.
+
 ## reruns
 
 - **Fires when** any sampled run was re-attempted (run attempt above 1). One finding for the
