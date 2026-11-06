@@ -340,6 +340,74 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
   only what it uses. *Trade-off:* a job that needs more must name it, so a missing grant shows as a
   403 the first time it runs.
 
+## merges do not wait for any check
+
+- **Fires when** the default branch's rulesets and branch protection were read and require no
+  status check, while pull requests get checks (a pull request run is in the window, or a workflow
+  file triggers on `pull_request`). Required checks come from `GET /rules/branches/{branch}`
+  (enforced rulesets) and the branch's protection summary (classic protection, when it is on).
+- **Confidence** confirmed. A risk, ranked first.
+- **Not claimed** when either source could not be read: an unknown is not "none". The JSON's
+  `gates.required_complete` says whether both were.
+- **Fix** require the checks that must pass, by the exact names pull requests show. *Trade-off:* a
+  required check that does not run on a pull request blocks it, so require only checks that run on
+  every pull request.
+
+## required checks no pull request reports
+
+- **Fires when** a required check bound to GitHub Actions (integration 15368) matches no
+  job of the newest completed pull request run of any workflow in the window (a run still going
+  may not have created all its jobs; a workflow with only an unfinished run leaves the absence
+  unknown). A job's name is the check
+  Actions reports: `name (value)` for a matrix leg, `caller / job` for a reusable workflow's job, and
+  a skipped job still reports. GitHub waits for a required check until it reports, so a pull
+  request without it cannot merge unless the rule is bypassed.
+- **Confidence** inferred: a workflow that ran on no pull request in the window, or one with a path
+  filter that the sampled pull requests did not touch, also leaves the name unreported.
+- **Not judged:** a required check bound to another app (a coverage service, a review bot), or
+  bound to no app (a classic protection context, or a ruleset entry without an app: any app may
+  report it, as Codecov reports `codecov/patch`), which the runs do not show. The evidence names
+  them. Nothing is claimed unless every sampled pull request run's jobs were read in
+  full (`gates.pr_jobs_complete`): a run with more than 100 jobs is read page by page, up to 10
+  pages, and a list cut short, or a run whose jobs could not be read, leaves the absence unknown.
+- **Fix** require the name pull requests show, or run the workflow on every pull request and skip
+  inside the job. *Trade-off:* a check that runs only for some paths cannot be required as it is.
+
+## pull request checks merges do not wait for
+
+- **Fires when** a check pull requests get is not required, and its name looks like a test, build,
+  lint, analysis or fuzzing job (`test`, `build`, `lint`, `check`, `verify`, `analyze`, `codeql`,
+  `typecheck`, `dist`, `e2e`, `fuzz`...). Other unrequired checks are counted, not listed.
+- **Confidence** inferred, from the name. A guard: it saves no minutes. Only claimed when both
+  sources of required checks were read.
+- **Fix** require the ones that must pass. *Trade-off:* a slow or flaky required check holds every
+  merge.
+
+## no workflow checks pull requests
+
+- **Fires when** every workflow file was read, none triggers on `pull_request`,
+  `pull_request_target` or `merge_group`, and no pull request run is in the window.
+- **Confidence** confirmed. A risk.
+- **Not claimed** when the workflow directory was not fully read.
+
+## no code scanning
+
+- **Fires when** every workflow file was read, no step's `uses:` is `github/codeql-action/init` or
+  `/analyze` (a commented-out step or a script that mentions it does not count), and no code
+  scanning default-setup run (`dynamic/github-code-scanning`) is in the window. On a private
+  repository the evidence notes that code scanning needs GitHub Advanced Security.
+- **Confidence** inferred: default setup that has not run in the window, or another scanner, is not
+  seen. A risk.
+
+## no dependency updates
+
+- **Fires when** the root and `.github` listings were read and show no `dependabot.yml` and no
+  Renovate configuration (`renovate.json`, `renovate.json5`, `.renovaterc`...), and no Dependabot
+  run is in the window.
+- **Confidence** confirmed. A risk: pinned actions and locked dependencies stay on what they were.
+- **Fix** a `.github/dependabot.yml` for `github-actions` and the repository's package ecosystem.
+  *Trade-off:* update pull requests to review.
+
 ## reruns
 
 - **Fires when** any sampled run was re-attempted (run attempt above 1). One finding for the

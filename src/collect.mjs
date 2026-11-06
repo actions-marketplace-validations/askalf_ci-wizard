@@ -148,8 +148,30 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   // stops early, a timeout runs to its limit. A few of each are timed apart, so the weekly cost
   // counts every outcome at its own measured cost (OUTCOMES in analyse.mjs).
   const outcomeSamples = new Map();
+  // Each run's jobs are read once: the timing samples and the merge-gate check share them.
+  // A run with more than 100 jobs (a large matrix) is read page by page, up to 10 pages; `complete`
+  // says whether every job was read, so an absent name is only a conclusion when it was.
+  const rawJobs = new Map();
+  const jobsRaw = (r) => {
+    if (!rawJobs.has(r.id)) {
+      rawJobs.set(r.id, (async () => {
+        const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100&page=${page}`;
+        const first = await client.get(url(1));
+        if (!first) return null;
+        const jobs = [...(first.jobs || [])];
+        const total = Number.isFinite(first.total_count) ? first.total_count : jobs.length;
+        const pages = Math.min(10, Math.ceil(total / 100));
+        if (pages > 1) {
+          const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
+          for (const d of rest) if (d) jobs.push(...(d.jobs || []));
+        }
+        return { ...first, jobs, complete: jobs.length >= total };
+      })());
+    }
+    return rawJobs.get(r.id);
+  };
   const jobsOf = async (r) => {
-    const j = await client.get(`repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`);
+    const j = await jobsRaw(r);
     return j ? (j.jobs || []).filter((x) => x.started_at && x.completed_at && x.conclusion !== 'skipped') : null;
   };
   // The sampled workflows' files are read beside their jobs.
@@ -222,5 +244,114 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   const root = rootListing || [];
   const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
-  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, only: wanted.length ? only : [], onlyMissing };
+  onProgress('reading merge gates');
+  const gates = await collectGates(client, repo, { runs, byWf, defaultBranch, rootNames: Array.isArray(rootListing) ? names : null, jobsRaw, settle, settled });
+  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
 }
+
+const PR_EVENTS = new Set(['pull_request', 'pull_request_target', 'merge_group']);
+const RENOVATE_FILES = ['renovate.json', 'renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5'];
+
+/**
+ * What guards a merge into the default branch, from what a read-only token can see: the required
+ * status checks of the branch's rulesets (GET rules/branches) and of classic branch protection (the
+ * branch's protection summary), the checks pull requests actually got (the jobs of each workflow's
+ * newest pull request run in the window: a job's name is the check Actions reports), whether code
+ * scanning runs, and whether dependency updates are configured. Anything that could not be read is
+ * null (unknown), never "none".
+ */
+async function collectGates(client, repo, { runs, byWf, defaultBranch, rootNames, jobsRaw, settle, settled }) {
+  const soft = async (p) => {
+    try {
+      return { ok: true, value: await settled(settle(p)) };
+    } catch (e) {
+      if (e instanceof RateLimitError) throw e;
+      return { ok: false, value: null };
+    }
+  };
+  const branch = defaultBranch ? encodeURIComponent(defaultBranch) : null;
+  // The newest completed pull request run of each workflow that ran on one in the window: a run
+  // still going may not have created all its jobs yet (a matrix computed by a setup job). Where only
+  // an unfinished run is there, its names still count as seen, but no absence is judged from it.
+  const prRuns = [];
+  let unfinishedOnly = false;
+  for (const rs of byWf.values()) {
+    const done = rs.find((r) => PR_EVENTS.has(r.event) && r.status === 'completed');
+    const any = done || rs.find((r) => PR_EVENTS.has(r.event));
+    if (!any) continue;
+    prRuns.push(any);
+    if (!done) unfinishedOnly = true;
+  }
+  const [rules, branchInfo, githubDir, ...prJobLists] = await Promise.all([
+    branch ? soft(client.get(`repos/${repo}/rules/branches/${branch}?per_page=100`)) : { ok: false, value: null },
+    branch ? soft(client.get(`repos/${repo}/branches/${branch}`)) : { ok: false, value: null },
+    soft(client.get(`repos/${repo}/contents/.github`)),
+    ...prRuns.map((r) => soft(jobsRaw(r))),
+  ]);
+  // Required checks: every enforced ruleset rule, and classic protection when it is on.
+  let required = null;
+  const rulesRead = rules.ok && Array.isArray(rules.value);
+  const protection = branchInfo.ok && branchInfo.value ? branchInfo.value.protection : undefined;
+  const classicRead = protection !== undefined && protection !== null;
+  if (rulesRead || classicRead) {
+    const seen = new Map();
+    // Kept per name and app: two rules can require the same name, one from any app and one from
+    // GitHub Actions, and the stricter one must not be lost to whichever the API lists first.
+    const add = (context, integrationId) => {
+      if (typeof context !== 'string' || !context) return;
+      const key = `${context}\u0000${integrationId ?? ''}`;
+      if (!seen.has(key)) seen.set(key, { context, integrationId: integrationId ?? null });
+    };
+    if (rulesRead) {
+      for (const rule of rules.value) {
+        if (rule && rule.type === 'required_status_checks') {
+          for (const c of (rule.parameters && rule.parameters.required_status_checks) || []) add(c && c.context, c && c.integration_id);
+        }
+      }
+    }
+    if (classicRead && protection.enabled !== false) {
+      const rsc = protection.required_status_checks || {};
+      if (rsc.enforcement_level !== 'off') {
+        for (const c of rsc.contexts || []) add(c, null);
+        for (const c of rsc.checks || []) add(c && c.context, c && c.app_id);
+      }
+    }
+    required = [...seen.values()];
+  }
+  // A claim that a check is not required (or that none is) needs both sources read: a check
+  // required by a source that could not be read would otherwise look unrequired.
+  const requiredComplete = rulesRead && classicRead;
+  const prChecks = new Set();
+  let prJobsRead = 0;
+  let prJobsComplete = prRuns.length > 0 && !unfinishedOnly;
+  prJobLists.forEach((r) => {
+    if (r.ok && r.value && Array.isArray(r.value.jobs)) {
+      prJobsRead += 1;
+      if (r.value.complete === false) prJobsComplete = false;
+      for (const j of r.value.jobs) if (j && typeof j.name === 'string') prChecks.add(j.name);
+    } else {
+      prJobsComplete = false;
+    }
+  });
+  // Code scanning: default setup runs as a dynamic workflow; advanced setup is a workflow file
+  // (read by the caller from scanFiles).
+  const codeScanningRuns = runs.some((r) => String(r.path || '').startsWith('dynamic/github-code-scanning'));
+  const dependabotRuns = runs.some((r) => String(r.path || '').startsWith('dynamic/dependabot'));
+  const ghNames = githubDir.ok && Array.isArray(githubDir.value) ? new Set(githubDir.value.map((x) => x && x.name)) : null;
+  const dependabotFile = ghNames ? ghNames.has('dependabot.yml') || ghNames.has('dependabot.yaml') : null;
+  const renovateFile = ghNames && rootNames ? RENOVATE_FILES.some((f) => rootNames.has(f) || ghNames.has(f)) : null;
+  return {
+    branch: defaultBranch,
+    required,
+    required_complete: requiredComplete,
+    pr_runs_seen: prRuns.length,
+    pr_runs_read: prJobsRead,
+    pr_jobs_complete: prJobsComplete,
+    pr_checks: [...prChecks].sort(),
+    code_scanning_runs: codeScanningRuns,
+    dependency_updates: dependabotRuns || dependabotFile || renovateFile ? true : dependabotFile === null || renovateFile === null ? null : false,
+  };
+}
+
+
+
