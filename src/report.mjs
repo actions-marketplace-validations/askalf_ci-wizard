@@ -93,9 +93,16 @@ const isWait = (f) => f.unit === 'wait' || (!f.unit && !(f.saving_min_week >= 1)
 const isRisk = (f) => f.unit === 'risk';
 const isGuard = (f) => f.unit === 'guard';
 
+// What each guard finding guards against, by its name; a guard this list does not know is "a guard".
+const GUARDS = {
+  'jobs without a working timeout': 'hung jobs',
+  'pull request checks merges do not wait for': 'merging a pull request whose checks fail',
+};
+const guardsAgainst = (f) => GUARDS[f.what] || null;
+
 export function savingText(f) {
   if (isRisk(f)) return 'a security and stability risk, not minutes';
-  if (isGuard(f)) return 'a guard against hung jobs, not minutes';
+  if (isGuard(f)) return guardsAgainst(f) ? `a guard against ${guardsAgainst(f)}, not minutes` : 'a guard, not minutes';
   if (isWait(f)) return 'saves developer wait, not job minutes';
   const unit = f.unit === 'billed' ? 'billed' : 'job';
   if (!(f.saving_min_week >= 1)) return `under 1 ${unit}-min/week (estimate)`;
@@ -160,7 +167,18 @@ export function summary(a) {
     parts.push(`${plural(billedFindings.length, 'finding')} would save about ${saved} billed minutes a week`);
   }
   if (waitOnly.length) parts.push(`${plural(waitOnly.length, 'finding')} would save developer wait rather than minutes`);
-  if (guards.length) parts.push(`${plural(guards.length, 'finding')} ${guards.length === 1 ? 'guards' : 'guard'} against hung jobs`);
+  // Guards whose purpose the report knows are counted with it, each purpose named once; any other
+  // guard is counted apart, so no purpose is given to a guard it does not belong to.
+  const known = guards.filter(guardsAgainst);
+  const unknown = guards.length - known.length;
+  if (known.length) {
+    const against = [...new Set(known.map(guardsAgainst))].map((g) => `against ${g}`);
+    parts.push(`${plural(known.length, 'finding')} ${known.length === 1 ? 'guards' : 'guard'} ${against.join(' and ')}`);
+  }
+  if (unknown) {
+    const kind = unknown === 1 ? (known.length ? 'is another guard' : 'is a guard') : (known.length ? 'are other guards' : 'are guards');
+    parts.push(`${plural(unknown, 'finding')} ${kind}`);
+  }
   const caveat = jobFindings.length || billedFindings.length ? ' Savings are estimates, and fixes can overlap, so they add up to an upper bound.' : '';
   L.push(`${usage} ${parts.join('; ')}.${caveat}`);
   return L;
