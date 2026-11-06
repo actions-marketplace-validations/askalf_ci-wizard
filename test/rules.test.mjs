@@ -216,14 +216,29 @@ test('many small scheduled jobs: three or more short periodic workflows, schedul
 });
 
 test('grouping: one finding per repeated kind, workflows listed, savings summed', () => {
-  const w = (name, tail) => ({ name, path: `.github/workflows/${name}.yml`, runs: runs(100), jobsPerRun: [[job({ selfHosted: true, tail })]] });
+  const w = (name, tail) => ({ name, path: `.github/workflows/${name}.yml`, runs: runs(100), jobsPerRun: Array.from({ length: 3 }, () => [job({ selfHosted: true, tail })]) });
   const a = audit([w('one', 8), w('two', 6)]);
   const f = find(a, 'self-hosted wrap-up tail');
   assert.equal(f.length, 1);
   assert.match(f[0].workflow, /^2 workflows: one, two$/);
-  assert.match(f[0].evidence, /shown for the largest/);
+  // Each workflow's own figure and saving, largest first, not the largest's alone.
+  assert.equal(f[0].evidence, 'median time after the last step before a job reports done (GitHub-hosted is about 2 s), by workflow: one 8 s, about 10 job-min/week; two 6 s, about 7 job-min/week');
   // (8 - 2) s x 100 runs / 60 + (6 - 2) s x 100 runs / 60
   assert.equal(f[0].saving_min_week, 16.7);
+  // A thinly sampled workflow is marked as such in the merged evidence.
+  const thin = { name: 'three', path: '.github/workflows/three.yml', runs: runs(100), jobsPerRun: [[job({ selfHosted: true, tail: 7 })]] };
+  const [g] = find(audit([w('one', 8), thin]), 'self-hosted wrap-up tail');
+  assert.match(g.evidence, /; three 7 s, about 8 job-min\/week, timed from only 1 successful run$/);
+  // Members each under a minute a week still show their saving, when together they are reported.
+  const small = (name) => ({ name, path: `.github/workflows/${name}.yml`, runs: runs(6), jobsPerRun: Array.from({ length: 3 }, () => [job({ selfHosted: true, tail: 8 })]) });
+  const [h] = find(audit([small('a'), small('b')]), 'self-hosted wrap-up tail');
+  assert.ok(h, 'two members of 0.6 job-min/week each make a 1.2 job-min/week finding');
+  assert.equal(h.evidence, 'median time after the last step before a job reports done (GitHub-hosted is about 2 s), by workflow: a 8 s, under 1 job-min/week; b 8 s, under 1 job-min/week');
+  // Queue wait saves no minutes: its members are ordered by the wait, not by job minutes.
+  const queued = (name, wait, seconds) => ({ name, path: `.github/workflows/${name}.yml`, runs: runs(50), jobsPerRun: Array.from({ length: 3 }, () => [job({ wait, steps: [['Run make', seconds]] })]) });
+  const [q] = find(audit([queued('busy', 30, 600), queued('starved', 120, 60)]), 'queue wait');
+  assert.match(q.workflow, /^2 workflows: starved, busy$/);
+  assert.match(q.evidence, /^p90 wait for a runner, by workflow: starved 120 s over 3 sampled jobs; busy 30 s over 3 sampled jobs$/);
 });
 
 test('findings are ranked by estimated saving, largest first', () => {
