@@ -117,6 +117,49 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 - **Estimate** 50% of setup time, times runs a week.
 - **Fix** runtime versions the runner image already has, or an image with the toolchain baked in.
   *Trade-off:* pinning to the image's version ties the job to the image's update schedule.
+- **On self-hosted runners** the rule fires at 2 s per step, when the workflow file has a
+  `actions/setup-*` step (node, python, go, dotnet, ruby; not java, whose setup writes a Maven
+  settings.xml with the job's credentials whatever its inputs) on a job whose `runs-on` names a
+  self-hosted label literally (an expression that mentions one may pick a hosted runner), whose
+  sampled runs were not on GitHub's hosted runners, and not in a `container:` (a container job's steps run inside that image, where the
+  host's runtime is not theirs), and the step sets up the runtime and nothing else (no `cache`, `cache-dependency-path`,
+  `bundler-cache`, `registry-url` or other input that restores a cache or signs in to a registry;
+  not `setup-go`, which caches by default, unless it says `cache: false`; and not `setup-node` from
+  v5, which caches the package manager's store by itself, or at a version the file does not show
+  as v4 or earlier (a SHA pin), unless it says `package-manager-cache: false`: dropping such a
+  step would lose that work), each such step priced from its own job's sampled runs: each step
+  qualifies on its own at 2 s per execution (the median); the saving is what the qualifying steps
+  cost a run, a mean over the sampled runs with every matrix leg of the job, the same measure as
+  the toolchain total it is taken from, so the 15 s rule never prices the same step again; and a
+  step whose name another step of the job shares, or carries an expression, is not priced, since
+  the sample cannot tell their timings apart. The host can carry the runtime,
+  so the step only restates a version: a tool-cache hit still costs the step, and a cold row
+  downloads the runtime again. **Estimate** those steps' time, times runs a week; the rest of the
+  workflow's toolchain time (hosted jobs' included) is judged by the 15 s rule above on its own. **Fix** the runtime the host has, its
+  version pinned in the host image, and no setup step. *Trade-off:* the job follows the host image's
+  update schedule, and a job that needs another version keeps its step.
+
+## test output floods the log
+
+- **Fires when** the median log of the sampled jobs in a workflow's newest successful run is 100
+  KB or more, and the workflow file starts a test runner (node --test, npm test, pytest, go test, cargo test and the like) or
+  most of the sampled jobs ran on self-hosted runners. A tool's own output on a hosted runner
+  (CodeQL, a fuzzer, Dependabot) is not the workflow's to quiet and costs it nothing. Only the
+  size is read, never the bytes: where the file starts a test runner, the evidence names its line
+  per passing test as the likely source, not the measured one. The size is read without the log: the job-logs endpoint answers with a redirect to
+  the file, and a HEAD of that address (no token) gives its length, one API call a job. What
+  fills a log that size is not read: where the file starts a test runner, its line per passing test
+  is the likely source, and otherwise the source is unknown. The runner streams every line to
+  GitHub as the job runs and uploads each step's log before it reports done; on a self-hosted
+  runner that upload is the wrap-up tail.
+- **Confidence** measured. Reported in megabytes a week (unit `log`), not minutes; it always
+  stays, like a queue wait.
+- **Estimate** the median log size, times jobs a run, times runs a week.
+- **Fix** a quiet reporter: `node --test --test-reporter=dot` (one character a test; Node 22 then
+  lists each failed test with its assertion and stack, and prints no count of passing tests),
+  `pytest -q`, `jest --silent`, `cargo test -q`, `go test` without `-v`. *Trade-off:* a passing run
+  shows no list and no count of what ran; the failures stay in full, and a reporter that drops
+  them is the wrong one.
 
 ## the same commit runs twice
 

@@ -6,6 +6,7 @@
 import { concurrencyGroupOf, categoryOf, forkReachableSelfHosted, allJobTimeouts, assignJobRuns, parseWorkflow, pushBranchesOf, stepCommands, triggersOf, withParseCache, workflowFacts } from './workflow.mjs';
 import { countBy, fmtS, mean, median, pct, round, secs, sum } from './util.mjs';
 import { scanFindings } from './scans.mjs';
+import { selfHostedSetups, startsTests } from './trim.mjs';
 import { gateFindings } from './gates.mjs';
 import { CANCEL_OUTDATED, ONE_RUN_PER_COMMIT, cacheExample, checkoutAdvice, forkGuardExample, managerOf, triggerExample } from './advice.mjs';
 
@@ -15,6 +16,12 @@ export const THRESHOLDS = {
   depsPerJobWithCache: 45,
   checkoutPerJob: 12,
   toolchainPerJob: 15,
+  // On a self-hosted runner the host can carry the runtime, so a setup step that only restates a
+  // version is worth dropping at a far lower cost than on a hosted image.
+  toolchainPerJobSelfHosted: 2,
+  // A passing job's log over this is more than a job needs to say it passed; what fills it is
+  // inferred from the workflow file, never read from the bytes.
+  logBytesPerJob: 100 * 1024,
   duplicateCommitsWeek: 3,
   supersededWeek: 2,
   matrixJobs: 8,
@@ -75,9 +82,9 @@ export function timeJobs(sampledRuns, commands) {
   const t = {
     secondsByCategory: {}, workStepSeconds: new Map(), jobSecondsPerRun: [], queueWaits: [], tails: [], heads: [],
     jobLengths: [], stepsPerJob: [], hostedJobs: 0, jobCount: 0, sawCacheStep: false, billedPerRun: [], jobDurations: new Map(),
-    jobHosted: new Map(),
+    jobHosted: new Map(), stepSeconds: new Map(), stepRunTotals: new Map(),
   };
-  for (const jobs of sampledRuns) {
+  for (const [r, jobs] of sampledRuns.entries()) {
     let runSeconds = 0;
     let billed = 0;
     for (const job of jobs) {
@@ -105,6 +112,15 @@ export function timeJobs(sampledRuns, commands) {
         const seconds = secs(step.started_at, step.completed_at);
         t.secondsByCategory[kind] = (t.secondsByCategory[kind] || 0) + seconds;
         if (kind === 'cache') t.sawCacheStep = true;
+        // Every step by its job and the name GitHub shows, so a rule that names a step in the file
+        // can price that step of that job: two jobs' "Run npm test" steps are two timings.
+        const label = `${jobName}\u0000${String(step.name).replace(/\s+/g, ' ').trim()}`;
+        if (!t.stepSeconds.has(label)) t.stepSeconds.set(label, []);
+        t.stepSeconds.get(label).push(seconds);
+        // And what the step costs a run: a matrix leg is one API job each, and a run pays them all.
+        if (!t.stepRunTotals.has(label)) t.stepRunTotals.set(label, []);
+        const totals = t.stepRunTotals.get(label);
+        totals[r] = (totals[r] || 0) + seconds;
         if (kind === 'work') {
           const name = String(step.name).replace(/\s+/g, ' ').slice(0, 60);
           if (!t.workStepSeconds.has(name)) t.workStepSeconds.set(name, []);
@@ -179,6 +195,32 @@ export function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileTex
   const facts = workflowFacts(doc);
   const timing = timeJobs(sampledRuns, stepCommands(doc));
   const shares = timeShares(timing);
+  // A step the file names, in a job the file names, priced from the sampled runs of that job
+  // (median seconds): the file's jobs are matched to the API's job names as the timeout rule
+  // matches them (a matrix leg "test (20)" is a run of job test). Null when the sample ran no such
+  // step of that job (a renamed step, a job the sample never ran, a job name two jobs share).
+  const jobRuns = assignJobRuns(allJobTimeouts(doc).map((t) => ({ id: t.id, name: t.name, reusable: Boolean(t.reusable) })), [...timing.jobDurations.keys()]);
+  // `each`: the median of one execution of the step; `perRun`: the mean over every sampled run of
+  // what the step cost that run (0 for a run without it), every matrix leg of the job included.
+  const priced = (jobId, name, { selfHostedOnly = false } = {}) => {
+    const label = String(name).replace(/\s+/g, ' ').trim();
+    // For the self-hosted rule only the job's runs that were not on GitHub's hosted runners count:
+    // a label that resolved to a hosted runner in the sample is not the host's setup to drop.
+    const apis = (jobRuns.get(jobId) || []).filter((api) => !selfHostedOnly || (timing.jobHosted.get(api) || 0) === 0);
+    const xs = apis.flatMap((api) => timing.stepSeconds.get(`${api}\u0000${label}`) || []);
+    if (!xs.length) return null;
+    const byRun = [];
+    for (const api of apis) {
+      const totals = timing.stepRunTotals.get(`${api}\u0000${label}`) || [];
+      totals.forEach((v, r) => { if (v !== undefined) byRun[r] = (byRun[r] || 0) + v; });
+    }
+    // perRun is a mean over every sampled run (a run without the step counts 0), the same measure
+    // as cats_secs_per_run, so what the self-hosted rule prices is exactly what it takes from the
+    // general rule's toolchain total.
+    const total = byRun.reduce((s, v) => s + (v || 0), 0);
+    return { each: round(median(xs), 1), perRun: round(total / Math.max(1, sampledRuns.length), 1) };
+  };
+  const logBytes = sampledRuns.flat().map((j) => j.log_bytes).filter((b) => Number.isFinite(b) && b >= 0);
   const sampledCount = sampledRuns.length;
   const medianRunSeconds = median(timing.jobSecondsPerRun);
   const successfulWalls = workflowRuns
@@ -274,6 +316,16 @@ export function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileTex
     job_timeouts: allJobTimeouts(doc),
     checkout: facts.checkout,
     fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3),
+    // A self-hosted setup step, priced from the sample by its job and step name: one execution,
+    // and what it costs a run (its matrix legs together); a name another step shares is not priced.
+    selfhosted_setups: selfHostedSetups(doc).map((s) => {
+      const p = s.unique ? priced(s.job, s.step, { selfHostedOnly: true }) : null;
+      return { ...s, seconds: p ? p.each : null, run_seconds: p ? p.perRun : null };
+    }),
+    // A passing job's log size, median over the sampled jobs whose size was read (null when none was).
+    log_bytes_p50: logBytes.length ? Math.round(median(logBytes)) : null,
+    log_jobs_read: logBytes.length,
+    starts_tests: startsTests(doc),
   };
 }
 
@@ -358,11 +410,46 @@ export function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultB
   }
 
   const tc = perRun.toolchain || 0;
-  if (tc / jobs >= T.toolchainPerJob) {
+  // Setup steps on self-hosted jobs, each priced from its own sampled runs: on a self-hosted
+  // runner the step restates a version the host can carry itself (a tool-cache hit still costs
+  // the step, a cold row downloads the runtime again), so the whole step is the saving. The
+  // general rule below judges the rest of the toolchain time, hosted jobs' included.
+  // Each self-hosted setup step qualifies on its own, by its per-execution median; the saving, and
+  // what leaves the general rule's total, is what the qualifying steps cost a run (a mean over the
+  // sampled runs, matrix legs included, the same measure as the toolchain total).
+  const selfSetups = (w.selfhosted_setups || []).filter((s) => s.seconds !== null && s.seconds !== undefined && s.seconds >= T.toolchainPerJobSelfHosted);
+  const selfSecs = selfSetups.reduce((s, x) => s + (x.run_seconds ?? x.seconds), 0);
+  if (selfSetups.length) {
+    const names = selfSetups.slice(0, 4).map((s) => `${s.action} in job ${s.job}, ${fmtS(s.seconds)}${s.run_seconds !== null && s.run_seconds !== s.seconds ? ` a leg, ${fmtS(s.run_seconds)} a run` : ''}`);
+    add(selfSecs * w.runs_week / 60, 'toolchain setup', `toolchain setup on self-hosted runners takes ${fmtS(selfSecs)} a run (${names.join('; ')}${selfSetups.length > 4 ? '; and more' : ''}), where the host can carry the runtime, so the step only restates its version`,
+      'use the runtime the host has, pin its version in the host image, and drop the setup step',
+      { confidence: 'inferred', tradeoff: "the job follows the host image's update schedule, and a job that needs another version keeps its step", brief: `${fmtS(selfSecs)} a run on self-hosted runners` });
+  }
+  const restTc = Math.max(0, tc - selfSecs);
+  if (restTc / jobs >= T.toolchainPerJob) {
     const note = w.setup_cache ? ' (this includes restoring the dependency cache, which the setup step does)' : '';
-    add(0.5 * tc * w.runs_week / 60, 'toolchain setup', `toolchain setup takes ${fmtS(tc / jobs)} per job${note}`,
+    add(0.5 * restTc * w.runs_week / 60, 'toolchain setup', `toolchain setup takes ${fmtS(restTc / jobs)} per job${note}`,
       'use runtime versions the runner image already has, or an image with the toolchain baked in',
-      { confidence: 'inferred', tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(tc / jobs)}${w.setup_cache ? ' (with its dependency cache restore)' : ''}` });
+      { confidence: 'inferred', tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(restTc / jobs)}${w.setup_cache ? ' (with its dependency cache restore)' : ''}` });
+  }
+
+  // A passing job's log the size of a test listing: streamed to GitHub as the job runs, uploaded
+  // step by step before the job reports done (on a self-hosted runner that upload is the wrap-up
+  // tail), and read by nobody. Reported in megabytes a week, not minutes.
+  // A tool's own output on a hosted runner (CodeQL, a fuzzer, Dependabot) is not the workflow's to
+  // quiet and costs it nothing: the rule needs a test runner in the file, or self-hosted runners,
+  // where every byte is uploaded from the host before the job reports done.
+  if (w.log_bytes_p50 !== null && w.log_bytes_p50 !== undefined && w.log_bytes_p50 >= T.logBytesPerJob && (w.starts_tests || w.hosted_share < 0.5)) {
+    const kb = Math.round(w.log_bytes_p50 / 1024);
+    const mbWeek = round((w.log_bytes_p50 * jobs * w.runs_week) / 1048576, 1);
+    F.push({
+      saving: 0, unit: 'log', confidence: 'measured', what: 'test output floods the log', workflow: w.workflow,
+      evidence: `a passing job's log is ${kb} KB (median of ${w.log_jobs_read} sampled job${w.log_jobs_read === 1 ? '' : 's'}), about ${mbWeek} MB a week over ${jobs} job${jobs === 1 ? '' : 's'} a run and ${Math.round(w.runs_week)} runs${w.starts_tests ? '; the workflow starts a test runner, whose line for each passing test is the likely source (the bytes themselves were not read)' : ''}; the runner streams every line to GitHub as the job runs and uploads each step's log before it reports done${w.hosted_share < 0.5 ? ', from a self-hosted runner' : ''}` + thin,
+      fix: 'a quiet reporter: node --test --test-reporter=dot (one character a test; Node 22 then lists each failed test with its assertion and stack, and prints no count of passing tests), pytest -q, jest --silent, cargo test -q, go test without -v',
+      tradeoff: 'a passing run shows no list and no count of what ran; the failures stay in full, and a reporter that drops them is the wrong one',
+      example: 'run: node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.mjs',
+      parts: null, brief: `${kb} KB a job`, size: w.log_bytes_p50, thin: w.thin_sample ? w.sampled_runs : null, log_mb_week: mbWeek,
+    });
   }
 
   if (w.dup_commits_week >= T.duplicateCommitsWeek) {
@@ -702,9 +789,11 @@ function analyseParsed(repo, data) {
   const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === 'public' ? true : data.visibility ? 'private' : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || new Map()), ...scanFindings(data.scanFiles || new Map(), { repo }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || new Map(), scanned: data.scanned, visibility: data.visibility })];
   // A finding that saves under a minute a week is noise next to the rest; one that saves developer
   // wait has no minutes to compare and always stays.
-  const findings = groupFindings(raw).filter((f) => f.unit === 'wait' || f.unit === 'risk' || f.unit === 'guard' || f.saving >= T.minSavingWeek).map((f) => ({
+  const findings = groupFindings(raw).filter((f) => f.unit === 'wait' || f.unit === 'risk' || f.unit === 'guard' || f.unit === 'log' || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1), unit: f.unit || 'job', workflow: f.workflow, what: f.what, evidence: f.evidence,
     fix: f.fix, tradeoff: f.tradeoff || '', example: f.example || '', confidence: f.confidence,
+    // A log finding's figure is megabytes a week, not minutes; it rides beside the saving.
+    ...(f.unit === 'log' ? { log_mb_week: f.log_mb_week } : {}),
   }));
   return {
     repo,

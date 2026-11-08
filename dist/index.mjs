@@ -7440,7 +7440,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
     }
   };
   let limit = null;
-  async function request(path, { raw = false } = {}) {
+  async function request(path, { raw = false, redirect = false } = {}) {
     const headers = {
       Accept: raw ? "application/vnd.github.raw" : "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
@@ -7454,7 +7454,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       inFlight++;
       try {
         calls++;
-        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs), ...redirect ? { redirect: "manual" } : {} });
       } catch (err) {
         inFlight--;
         if (remaining !== null) remaining -= 1;
@@ -7482,6 +7482,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       const reset = res.headers.get("x-ratelimit-reset");
       const resetAt = reset ? new Date(Number(reset) * 1e3) : null;
       if (res.status === 404) return null;
+      if (redirect && (res.status === 301 || res.status === 302 || res.status === 307)) return res.headers.get("location");
       if ((res.status === 403 || res.status === 429) && (remaining === 0 || res.headers.get("retry-after"))) {
         throw new RateLimitError(remaining ?? 0, resetAt, limit);
       }
@@ -7521,9 +7522,23 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       release();
     }
   }
+  async function sizeOf(path) {
+    const location = await limited(path, { redirect: true });
+    if (typeof location !== "string" || !/^https:\/\//.test(location)) return null;
+    try {
+      const head = await fetchImpl(location, { method: "HEAD", signal: AbortSignal.timeout(timeoutMs) });
+      const raw = head.headers.get("content-length");
+      if (raw === null) return null;
+      const n = Number(raw);
+      return head.ok && Number.isFinite(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
   return {
     get: (path) => limited(path),
     getRaw: (path) => limited(path, { raw: true }),
+    sizeOf,
     get calls() {
       return calls;
     },
@@ -7560,7 +7575,7 @@ function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
   for (const g of labelled) out.set(taken.get(g.name) > 1 && g.path ? `${g.name} (${g.path})` : g.name, g.rs);
   return out;
 }
-async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, onProgress = () => {
+async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, logs = true, onProgress = () => {
 } } = {}) {
   const since = new Date(now.getTime() - days * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
   const runs = [];
@@ -7655,7 +7670,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     }
     return rawJobs.get(r.id);
   };
-  const jobsOf2 = async (r) => {
+  const jobsOf3 = async (r) => {
     const j = await jobsRaw(r);
     return j ? (j.jobs || []).filter((x) => x.started_at && x.completed_at && x.conclusion !== "skipped") : null;
   };
@@ -7666,8 +7681,8 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     const ok = rs.filter((r) => r.status === "completed" && r.conclusion === "success").slice(0, perWorkflow);
     const outcomes = ["failure", "cancelled", "timed_out"].map((outcome) => [outcome, rs.filter((r) => r.status === "completed" && r.conclusion === outcome).slice(0, perOutcome)]);
     const [okJobs, ...outcomeJobs] = await Promise.all([
-      Promise.all(ok.map(jobsOf2)),
-      ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf2)))
+      Promise.all(ok.map(jobsOf3)),
+      ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf3)))
     ]);
     const byOutcome = {};
     outcomes.forEach(([outcome], i) => {
@@ -7679,6 +7694,15 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   for (const [wf, jobsPerRun, byOutcome] of timed) {
     samples.set(wf, jobsPerRun);
     outcomeSamples.set(wf, byOutcome);
+  }
+  if (logs && typeof client.sizeOf === "function") {
+    onProgress("reading log sizes");
+    const newest = [...samples.values()].flatMap((jobsPerRun) => jobsPerRun[0] || []).filter((j) => j && j.id != null);
+    const sizes = await Promise.all(newest.map((j) => settle(client.sizeOf(`repos/${repo}/actions/jobs/${j.id}/logs`))));
+    newest.forEach((j, i) => {
+      const s = sizes[i];
+      if (s && Number.isFinite(s.value)) j.log_bytes = s.value;
+    });
   }
   onProgress("reading workflow files");
   const files = /* @__PURE__ */ new Map();
@@ -8566,6 +8590,12 @@ function workflowFacts(doc) {
     checkout
   };
 }
+function runsOnSelfHosted(runsOn) {
+  if (runsOn === void 0 || runsOn === null) return false;
+  if (Array.isArray(runsOn)) return runsOn.some((l) => /self-hosted/i.test(String(l)));
+  if (typeof runsOn === "object") return Array.isArray(runsOn.labels) ? runsOn.labels.some((l) => /self-hosted/i.test(String(l))) : /self-hosted/i.test(String(runsOn.labels || ""));
+  return /self-hosted/i.test(String(runsOn));
+}
 function picksSelfHosted(value, raw) {
   const mentions = /self-hosted/i.test(typeof raw === "string" ? raw : JSON.stringify(raw ?? ""));
   if (value === UNKNOWN) return mentions ? null : false;
@@ -9034,6 +9064,80 @@ function scanFindings(files, { repo = null } = {}) {
   return F;
 }
 
+// src/trim.mjs
+var TEST_RUNNERS = [
+  /^node --test\b/,
+  /^(npm|pnpm|yarn|bun) (run )?(test|t)\b/,
+  /^(npx |pnpm exec |pnpm dlx |yarn )?(jest|vitest|mocha|ava|tap|uvu)\b/,
+  /^(python3? -m )?pytest\b/,
+  /^(python3? -m )?unittest\b/,
+  /^go test\b/,
+  /^cargo (test|nextest run)\b/,
+  /^(bundle exec )?rspec\b/,
+  /^dotnet test\b/,
+  /^(mvn|\.\/mvnw) (verify|test)\b/,
+  /^(gradle|\.\/gradlew) (test|check)\b/,
+  /^make (test|check)\b/,
+  /^ctest\b/,
+  /^(vendor\/bin\/)?(phpunit|pest)\b/
+];
+var REPORTING = [
+  /\s--test-reporter(-destination)?(=\S+|\s+\S+)/g,
+  /\s--reporter(=\S+|\s+\S+)/g,
+  /\s--(quiet|verbose|silent|no-color|color)\b/g,
+  /\s-(q|v|vv)\b/g
+];
+var KEYWORDS = /* @__PURE__ */ new Set(["then", "do", "else", "elif", "{", "(", "!", "time", "exec"]);
+function testCommands(script) {
+  const out = [];
+  for (const words of shellCommands(script)) {
+    const ws = [...words];
+    while (ws.length && KEYWORDS.has(ws[0])) ws.shift();
+    let cmd = ws.join(" ");
+    if (!TEST_RUNNERS.some((rx) => rx.test(cmd))) continue;
+    for (const rx of REPORTING) cmd = cmd.replace(rx, "");
+    out.push(cmd.replace(/\s+/g, " ").replace(/\s--$/, "").trim());
+  }
+  return out;
+}
+function jobsOf2(doc) {
+  return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object");
+}
+function stepsOf2(job) {
+  return Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
+}
+function stepName(st, i = 0) {
+  if (st.name) return String(st.name).trim();
+  if (st.uses) return `Run ${st.uses}`;
+  if (st.run !== void 0) return `Run ${String(st.run).trim().split("\n")[0]}`;
+  return `step ${i + 1}`;
+}
+function startsTests(doc) {
+  return jobsOf2(doc).some(([, job]) => stepsOf2(job).some((st) => st.run !== void 0 && testCommands(st.run).length > 0));
+}
+function selfHostedSetups(doc) {
+  const found = [];
+  for (const [id, job] of jobsOf2(doc)) {
+    if (!runsOnSelfHosted(job["runs-on"]) || JSON.stringify(job["runs-on"] ?? null).includes("${{")) continue;
+    if (job.container !== void 0 && job.container !== null) continue;
+    stepsOf2(job).forEach((st, i) => {
+      const m = /^actions\/setup-(node|python|go|dotnet|ruby)@/.exec(String(st.uses || ""));
+      if (!m) return;
+      const w = st.with && typeof st.with === "object" ? st.with : {};
+      const off = (k) => String(w[k] ?? "").trim().toLowerCase() === "false";
+      if (Object.keys(w).some((k) => /^(cache|cache-dependency-path|bundler-cache|registry-url|scope|always-auth|server-id|server-username|server-password|gpg-private-key|source-url|package-manager-cache)$/.test(k) && !((k === "cache" || k === "package-manager-cache") && off(k)))) return;
+      if (m[1] === "go" && !off("cache")) return;
+      const major = /@v(\d+)(\.|$)/.exec(String(st.uses));
+      if (m[1] === "node" && !(major && Number(major[1]) <= 4) && !off("package-manager-cache")) return;
+      const name = stepName(st, i);
+      const shown = (x) => String(x).replace(/\s+/g, " ").trim();
+      const unique = !name.includes("${{") && stepsOf2(job).filter((x, k) => shown(stepName(x, k)) === shown(name)).length === 1;
+      found.push({ job: id, step: name, action: `setup-${m[1]}`, unique });
+    });
+  }
+  return found;
+}
+
 // src/gates.mjs
 var ACTIONS_APP = 15368;
 var isActionsCheck = (c) => c.integrationId === ACTIONS_APP;
@@ -9360,6 +9464,12 @@ var THRESHOLDS = {
   depsPerJobWithCache: 45,
   checkoutPerJob: 12,
   toolchainPerJob: 15,
+  // On a self-hosted runner the host can carry the runtime, so a setup step that only restates a
+  // version is worth dropping at a far lower cost than on a hosted image.
+  toolchainPerJobSelfHosted: 2,
+  // A passing job's log over this is more than a job needs to say it passed; what fills it is
+  // inferred from the workflow file, never read from the bytes.
+  logBytesPerJob: 100 * 1024,
   duplicateCommitsWeek: 3,
   supersededWeek: 2,
   matrixJobs: 8,
@@ -9411,9 +9521,11 @@ function timeJobs(sampledRuns, commands) {
     sawCacheStep: false,
     billedPerRun: [],
     jobDurations: /* @__PURE__ */ new Map(),
-    jobHosted: /* @__PURE__ */ new Map()
+    jobHosted: /* @__PURE__ */ new Map(),
+    stepSeconds: /* @__PURE__ */ new Map(),
+    stepRunTotals: /* @__PURE__ */ new Map()
   };
-  for (const jobs of sampledRuns) {
+  for (const [r, jobs] of sampledRuns.entries()) {
     let runSeconds = 0;
     let billed = 0;
     for (const job of jobs) {
@@ -9437,6 +9549,12 @@ function timeJobs(sampledRuns, commands) {
         const seconds = secs(step.started_at, step.completed_at);
         t.secondsByCategory[kind] = (t.secondsByCategory[kind] || 0) + seconds;
         if (kind === "cache") t.sawCacheStep = true;
+        const label = `${jobName}\0${String(step.name).replace(/\s+/g, " ").trim()}`;
+        if (!t.stepSeconds.has(label)) t.stepSeconds.set(label, []);
+        t.stepSeconds.get(label).push(seconds);
+        if (!t.stepRunTotals.has(label)) t.stepRunTotals.set(label, []);
+        const totals = t.stepRunTotals.get(label);
+        totals[r] = (totals[r] || 0) + seconds;
         if (kind === "work") {
           const name = String(step.name).replace(/\s+/g, " ").slice(0, 60);
           if (!t.workStepSeconds.has(name)) t.workStepSeconds.set(name, []);
@@ -9497,6 +9615,23 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
   const facts = workflowFacts(doc);
   const timing = timeJobs(sampledRuns, stepCommands(doc));
   const shares = timeShares(timing);
+  const jobRuns = assignJobRuns(allJobTimeouts(doc).map((t) => ({ id: t.id, name: t.name, reusable: Boolean(t.reusable) })), [...timing.jobDurations.keys()]);
+  const priced = (jobId, name, { selfHostedOnly = false } = {}) => {
+    const label = String(name).replace(/\s+/g, " ").trim();
+    const apis = (jobRuns.get(jobId) || []).filter((api) => !selfHostedOnly || (timing.jobHosted.get(api) || 0) === 0);
+    const xs = apis.flatMap((api) => timing.stepSeconds.get(`${api}\0${label}`) || []);
+    if (!xs.length) return null;
+    const byRun = [];
+    for (const api of apis) {
+      const totals = timing.stepRunTotals.get(`${api}\0${label}`) || [];
+      totals.forEach((v, r) => {
+        if (v !== void 0) byRun[r] = (byRun[r] || 0) + v;
+      });
+    }
+    const total = byRun.reduce((s, v) => s + (v || 0), 0);
+    return { each: round(median(xs), 1), perRun: round(total / Math.max(1, sampledRuns.length), 1) };
+  };
+  const logBytes = sampledRuns.flat().map((j) => j.log_bytes).filter((b) => Number.isFinite(b) && b >= 0);
   const sampledCount = sampledRuns.length;
   const medianRunSeconds = median(timing.jobSecondsPerRun);
   const successfulWalls = workflowRuns.filter((r) => r.status === "completed" && r.conclusion === "success" && r.run_started_at).map((r) => secs(r.run_started_at, r.updated_at));
@@ -9587,7 +9722,17 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
     fork_reachable: forkReachableSelfHosted(doc, repo),
     job_timeouts: allJobTimeouts(doc),
     checkout: facts.checkout,
-    fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3)
+    fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3),
+    // A self-hosted setup step, priced from the sample by its job and step name: one execution,
+    // and what it costs a run (its matrix legs together); a name another step shares is not priced.
+    selfhosted_setups: selfHostedSetups(doc).map((s) => {
+      const p = s.unique ? priced(s.job, s.step, { selfHostedOnly: true }) : null;
+      return { ...s, seconds: p ? p.each : null, run_seconds: p ? p.perRun : null };
+    }),
+    // A passing job's log size, median over the sampled jobs whose size was read (null when none was).
+    log_bytes_p50: logBytes.length ? Math.round(median(logBytes)) : null,
+    log_jobs_read: logBytes.length,
+    starts_tests: startsTests(doc)
   };
 }
 var T = THRESHOLDS;
@@ -9674,15 +9819,48 @@ function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch =
     }
   }
   const tc = perRun.toolchain || 0;
-  if (tc / jobs >= T.toolchainPerJob) {
+  const selfSetups = (w.selfhosted_setups || []).filter((s) => s.seconds !== null && s.seconds !== void 0 && s.seconds >= T.toolchainPerJobSelfHosted);
+  const selfSecs = selfSetups.reduce((s, x) => s + (x.run_seconds ?? x.seconds), 0);
+  if (selfSetups.length) {
+    const names = selfSetups.slice(0, 4).map((s) => `${s.action} in job ${s.job}, ${fmtS(s.seconds)}${s.run_seconds !== null && s.run_seconds !== s.seconds ? ` a leg, ${fmtS(s.run_seconds)} a run` : ""}`);
+    add(
+      selfSecs * w.runs_week / 60,
+      "toolchain setup",
+      `toolchain setup on self-hosted runners takes ${fmtS(selfSecs)} a run (${names.join("; ")}${selfSetups.length > 4 ? "; and more" : ""}), where the host can carry the runtime, so the step only restates its version`,
+      "use the runtime the host has, pin its version in the host image, and drop the setup step",
+      { confidence: "inferred", tradeoff: "the job follows the host image's update schedule, and a job that needs another version keeps its step", brief: `${fmtS(selfSecs)} a run on self-hosted runners` }
+    );
+  }
+  const restTc = Math.max(0, tc - selfSecs);
+  if (restTc / jobs >= T.toolchainPerJob) {
     const note = w.setup_cache ? " (this includes restoring the dependency cache, which the setup step does)" : "";
     add(
-      0.5 * tc * w.runs_week / 60,
+      0.5 * restTc * w.runs_week / 60,
       "toolchain setup",
-      `toolchain setup takes ${fmtS(tc / jobs)} per job${note}`,
+      `toolchain setup takes ${fmtS(restTc / jobs)} per job${note}`,
       "use runtime versions the runner image already has, or an image with the toolchain baked in",
-      { confidence: "inferred", tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(tc / jobs)}${w.setup_cache ? " (with its dependency cache restore)" : ""}` }
+      { confidence: "inferred", tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(restTc / jobs)}${w.setup_cache ? " (with its dependency cache restore)" : ""}` }
     );
+  }
+  if (w.log_bytes_p50 !== null && w.log_bytes_p50 !== void 0 && w.log_bytes_p50 >= T.logBytesPerJob && (w.starts_tests || w.hosted_share < 0.5)) {
+    const kb = Math.round(w.log_bytes_p50 / 1024);
+    const mbWeek = round(w.log_bytes_p50 * jobs * w.runs_week / 1048576, 1);
+    F.push({
+      saving: 0,
+      unit: "log",
+      confidence: "measured",
+      what: "test output floods the log",
+      workflow: w.workflow,
+      evidence: `a passing job's log is ${kb} KB (median of ${w.log_jobs_read} sampled job${w.log_jobs_read === 1 ? "" : "s"}), about ${mbWeek} MB a week over ${jobs} job${jobs === 1 ? "" : "s"} a run and ${Math.round(w.runs_week)} runs${w.starts_tests ? "; the workflow starts a test runner, whose line for each passing test is the likely source (the bytes themselves were not read)" : ""}; the runner streams every line to GitHub as the job runs and uploads each step's log before it reports done${w.hosted_share < 0.5 ? ", from a self-hosted runner" : ""}` + thin,
+      fix: "a quiet reporter: node --test --test-reporter=dot (one character a test; Node 22 then lists each failed test with its assertion and stack, and prints no count of passing tests), pytest -q, jest --silent, cargo test -q, go test without -v",
+      tradeoff: "a passing run shows no list and no count of what ran; the failures stay in full, and a reporter that drops them is the wrong one",
+      example: "run: node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.mjs",
+      parts: null,
+      brief: `${kb} KB a job`,
+      size: w.log_bytes_p50,
+      thin: w.thin_sample ? w.sampled_runs : null,
+      log_mb_week: mbWeek
+    });
   }
   if (w.dup_commits_week >= T.duplicateCommitsWeek) {
     const isDefault = (b) => defaultBranch ? b === defaultBranch : b === "main" || b === "master";
@@ -9987,7 +10165,7 @@ function analyseParsed(repo, data) {
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
   const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map(), { repo }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
-  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.saving >= T.minSavingWeek).map((f) => ({
+  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.unit === "log" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",
     workflow: f.workflow,
@@ -9996,7 +10174,9 @@ function analyseParsed(repo, data) {
     fix: f.fix,
     tradeoff: f.tradeoff || "",
     example: f.example || "",
-    confidence: f.confidence
+    confidence: f.confidence,
+    // A log finding's figure is megabytes a week, not minutes; it rides beside the saving.
+    ...f.unit === "log" ? { log_mb_week: f.log_mb_week } : {}
   }));
   return {
     repo,
@@ -10078,6 +10258,7 @@ var GUARDS = {
 var guardsAgainst = (f) => GUARDS[f.what] || null;
 function savingText(f) {
   if (isRisk(f)) return "a security and stability risk, not minutes";
+  if (f.unit === "log") return num(f.log_mb_week) ? `about ${f.log_mb_week} MB of log a week (measured), not minutes` : "log volume, not minutes";
   if (isGuard(f)) return guardsAgainst(f) ? `a guard against ${guardsAgainst(f)}, not minutes` : "a guard, not minutes";
   if (isWait(f)) return "saves developer wait, not job minutes";
   const unit = f.unit === "billed" ? "billed" : "job";

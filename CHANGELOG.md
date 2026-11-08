@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Setups a self-hosted host already carries, and logs nobody reads. Found by hand on a self-hosted
+repository on 2026-11-08 (an 80 s job with a 471 KB log, cut to 17 s and 41 KB), now rules:
+
+- **toolchain setup** on self-hosted runners fires at 2 s a step when the file has a runtime-only
+  setup action there (no cache, registry or signing input; `setup-go` only with `cache: false`):
+  the host can carry the runtime, and the whole step is the saving, priced from its own job's
+  sampled runs.
+- **test output floods the log:** a passing job's log of 100 KB or more, in megabytes a week.
+  Read from one new endpoint, the job-logs redirect, followed by a HEAD for the size; the log is
+  never downloaded. `collect` takes `logs: false` to skip it.
+
 ## 0.3.0
 
 Merge gates: what stands between a pull request and the default branch.
