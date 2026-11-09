@@ -42,13 +42,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * API; none that matters is more than a few).
  */
 async function readCapped(res, max, path) {
+  return (await readCappedBytes(res, max, path)).toString('utf8');
+}
+
+/** The same, as the bytes themselves (an artifact's zip is read for its directory, not as text). */
+async function readCappedBytes(res, max, path) {
   const tooLarge = () => new GitHubError('answer too large', path, `more than ${Math.round(max / 1048576)} MB`);
   const declared = Number(res.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > max) throw tooLarge();
   if (!res.body || typeof res.body.getReader !== 'function') {
-    const text = await res.text();
-    if (Buffer.byteLength(text) > max) throw tooLarge();
-    return text;
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length > max) throw tooLarge();
+    return bytes;
   }
   const reader = res.body.getReader();
   const chunks = [];
@@ -63,7 +68,7 @@ async function readCapped(res, max, path) {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString('utf8');
+  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
 }
 
 /**
@@ -130,7 +135,7 @@ export function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = 'h
   // no token. It says which budget an audit drew on, and so whether a larger one is available.
   let limit = null;
 
-  async function request(path, { raw = false } = {}) {
+  async function request(path, { raw = false, redirect = false } = {}) {
     const headers = {
       Accept: raw ? 'application/vnd.github.raw' : 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -149,7 +154,7 @@ export function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = 'h
         calls++;
         // Each attempt has its own deadline, the body's reading included, so a server that stops
         // answering cannot hold the audit (and, in the action, the runner) indefinitely.
-        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs), ...(redirect ? { redirect: 'manual' } : {}) });
       } catch (err) {
         inFlight--;
         // No answer means no new count, but GitHub may have received and charged the request: count
@@ -183,6 +188,9 @@ export function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = 'h
       const reset = res.headers.get('x-ratelimit-reset');
       const resetAt = reset ? new Date(Number(reset) * 1000) : null;
       if (res.status === 404) return null;
+      // An endpoint that answers with a redirect to a file (a job's log): the file's address is the
+      // answer, and the file itself is not read here.
+      if (redirect && (res.status === 301 || res.status === 302 || res.status === 307)) return res.headers.get('location');
       if ((res.status === 403 || res.status === 429) && (remaining === 0 || res.headers.get('retry-after'))) {
         throw new RateLimitError(remaining ?? 0, resetAt, limit);
       }
@@ -227,9 +235,50 @@ export function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = 'h
     }
   }
 
+  /**
+   * The size in bytes of the file an endpoint redirects to (a job's log), from a HEAD of the file's
+   * address; null when there is no redirect, no size, or the file's host does not answer. The
+   * redirect costs one API call; the HEAD goes to the file's host, outside the API and its budget,
+   * and carries no token.
+   */
+  async function sizeOf(path) {
+    const location = await limited(path, { redirect: true });
+    if (typeof location !== 'string' || !/^https:\/\//.test(location)) return null;
+    try {
+      const head = await fetchImpl(location, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs) });
+      const raw = head.headers.get('content-length');
+      if (raw === null) return null; // no length is no size, not an empty log
+      const n = Number(raw);
+      return head.ok && Number.isFinite(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The file an endpoint redirects to (a job's log, an artifact's zip), read in full up to `max`
+   * bytes: as text, or as bytes with `bytes: true`. Null when there is no redirect, the file's host
+   * does not answer, or the file is larger than `max`: a file too large to read is no evidence,
+   * not an error. The redirect costs one API call; the file comes from its host, outside the API
+   * and its budget, and the request carries no token.
+   */
+  async function fileOf(path, { bytes = false, max = maxBytes } = {}) {
+    const location = await limited(path, { redirect: true });
+    if (typeof location !== 'string' || !/^https:\/\//.test(location)) return null;
+    try {
+      const res = await fetchImpl(location, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return null;
+      return bytes ? await readCappedBytes(res, max, path) : await readCapped(res, max, path);
+    } catch {
+      return null;
+    }
+  }
+
   return {
     get: (path) => limited(path),
     getRaw: (path) => limited(path, { raw: true }),
+    sizeOf,
+    fileOf,
     get calls() {
       return calls;
     },

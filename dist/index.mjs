@@ -7396,13 +7396,16 @@ var GitHubError = class extends Error {
 };
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function readCapped(res, max, path) {
+  return (await readCappedBytes(res, max, path)).toString("utf8");
+}
+async function readCappedBytes(res, max, path) {
   const tooLarge = () => new GitHubError("answer too large", path, `more than ${Math.round(max / 1048576)} MB`);
   const declared = Number(res.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > max) throw tooLarge();
   if (!res.body || typeof res.body.getReader !== "function") {
-    const text = await res.text();
-    if (Buffer.byteLength(text) > max) throw tooLarge();
-    return text;
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length > max) throw tooLarge();
+    return bytes;
   }
   const reader = res.body.getReader();
   const chunks = [];
@@ -7418,7 +7421,7 @@ async function readCapped(res, max, path) {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString("utf8");
+  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
 }
 function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://api.github.com", minRemaining = 25, backoffMs = [1e3, 3e3], timeoutMs = 3e4, maxBytes = 20 * 1048576, concurrency = 6 } = {}) {
   if (!/^https:\/\/[^/?#@\s]+(\/[^?#\s]*)?$/.test(String(baseUrl))) throw new Error(`the API base must be an https URL: ${baseUrl}`);
@@ -7440,7 +7443,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
     }
   };
   let limit = null;
-  async function request(path, { raw = false } = {}) {
+  async function request(path, { raw = false, redirect = false } = {}) {
     const headers = {
       Accept: raw ? "application/vnd.github.raw" : "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
@@ -7454,7 +7457,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       inFlight++;
       try {
         calls++;
-        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs), ...redirect ? { redirect: "manual" } : {} });
       } catch (err) {
         inFlight--;
         if (remaining !== null) remaining -= 1;
@@ -7482,6 +7485,7 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       const reset = res.headers.get("x-ratelimit-reset");
       const resetAt = reset ? new Date(Number(reset) * 1e3) : null;
       if (res.status === 404) return null;
+      if (redirect && (res.status === 301 || res.status === 302 || res.status === 307)) return res.headers.get("location");
       if ((res.status === 403 || res.status === 429) && (remaining === 0 || res.headers.get("retry-after"))) {
         throw new RateLimitError(remaining ?? 0, resetAt, limit);
       }
@@ -7521,9 +7525,35 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
       release();
     }
   }
+  async function sizeOf(path) {
+    const location = await limited(path, { redirect: true });
+    if (typeof location !== "string" || !/^https:\/\//.test(location)) return null;
+    try {
+      const head = await fetchImpl(location, { method: "HEAD", signal: AbortSignal.timeout(timeoutMs) });
+      const raw = head.headers.get("content-length");
+      if (raw === null) return null;
+      const n = Number(raw);
+      return head.ok && Number.isFinite(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+  async function fileOf(path, { bytes = false, max = maxBytes } = {}) {
+    const location = await limited(path, { redirect: true });
+    if (typeof location !== "string" || !/^https:\/\//.test(location)) return null;
+    try {
+      const res = await fetchImpl(location, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return null;
+      return bytes ? await readCappedBytes(res, max, path) : await readCapped(res, max, path);
+    } catch {
+      return null;
+    }
+  }
   return {
     get: (path) => limited(path),
     getRaw: (path) => limited(path, { raw: true }),
+    sizeOf,
+    fileOf,
     get calls() {
       return calls;
     },
@@ -7533,270 +7563,6 @@ function createClient({ token, fetchImpl = globalThis.fetch, baseUrl = "https://
     get limit() {
       return limit;
     }
-  };
-}
-
-// src/collect.mjs
-var encodePath = (path) => String(path).split("/").map(encodeURIComponent).join("/");
-var LOCKFILES = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum", "Cargo.lock", "Gemfile.lock"];
-function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
-  const groups = /* @__PURE__ */ new Map();
-  for (const r of runs) {
-    const key = r.workflow_id != null ? `id:${r.workflow_id}` : r.path ? `path:${String(r.path).split("@")[0]}` : `name:${r.name}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(r);
-  }
-  const labelled = [...groups.values()].map((rs) => {
-    const counts = /* @__PURE__ */ new Map();
-    for (const r of rs) counts.set(r.name, (counts.get(r.name) || 0) + 1);
-    const best = Math.max(...counts.values());
-    const known = rs[0].workflow_id != null ? names.get(rs[0].workflow_id) : void 0;
-    const name = typeof known === "string" && known ? known : String(rs.find((r) => counts.get(r.name) === best).name);
-    return { name, path: String(rs[0].path || "").split("@")[0], rs };
-  });
-  const taken = /* @__PURE__ */ new Map();
-  for (const g of labelled) taken.set(g.name, (taken.get(g.name) || 0) + 1);
-  const out = /* @__PURE__ */ new Map();
-  for (const g of labelled) out.set(taken.get(g.name) > 1 && g.path ? `${g.name} (${g.path})` : g.name, g.rs);
-  return out;
-}
-async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, onProgress = () => {
-} } = {}) {
-  const since = new Date(now.getTime() - days * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
-  const runs = [];
-  let truncated = false;
-  onProgress("reading workflow runs");
-  const runsPage = (page) => client.get(`repos/${repo}/actions/runs?per_page=100&page=${page}&created=${encodeURIComponent(">=" + since)}`);
-  const first = await runsPage(1);
-  if (!first) throw new NotFoundError(repo);
-  runs.push(...first.workflow_runs || []);
-  if (!runs.length) return null;
-  const total = Number.isFinite(first.total_count) ? first.total_count : null;
-  const settle = (p) => p.then((value) => ({ value }), (error) => ({ error }));
-  const settled = async (p) => {
-    const r = await p;
-    if (r.error) throw r.error;
-    return r.value;
-  };
-  const early = {
-    listing: settle(client.get(`repos/${repo}/contents/.github/workflows`)),
-    meta: settle(client.get(`repos/${repo}`)),
-    root: settle(client.get(`repos/${repo}/contents`)),
-    workflows: settle(client.get(`repos/${repo}/actions/workflows?per_page=100&page=1`))
-  };
-  if ((first.workflow_runs || []).length === 100 && maxPages > 1) {
-    if (total !== null) {
-      const pages = Math.min(maxPages, Math.ceil(total / 100));
-      const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => runsPage(i + 2)));
-      for (const d of rest) if (d) runs.push(...d.workflow_runs || []);
-      truncated = total > maxPages * 100;
-    } else {
-      for (let page = 2; page <= maxPages; page++) {
-        const d = await runsPage(page);
-        if (!d) break;
-        const batch = d.workflow_runs || [];
-        runs.push(...batch);
-        if (batch.length < 100) break;
-        if (page === maxPages) truncated = true;
-      }
-    }
-  } else if ((first.workflow_runs || []).length === 100 && maxPages === 1) {
-    truncated = total === null || total > 100;
-  }
-  const seenRuns = /* @__PURE__ */ new Set();
-  for (let i = runs.length - 1; i >= 0; i--) {
-    const id = runs[i] && runs[i].id;
-    if (id == null) continue;
-    if (seenRuns.has(id)) runs.splice(i, 1);
-    else seenRuns.add(id);
-  }
-  if (!runs.length) return null;
-  const oldest = Math.min(...runs.map((r) => Date.parse(r.created_at)));
-  const coveredDays = truncated ? Math.max(0.25, (now.getTime() - oldest) / 864e5) : days;
-  const workflowNames = /* @__PURE__ */ new Map();
-  const wantedIds = new Set(runs.map((r) => r.workflow_id).filter((id) => id != null));
-  try {
-    for (let page = 1, seen = 0; ; page++) {
-      const listed2 = page === 1 ? await settled(early.workflows) : await client.get(`repos/${repo}/actions/workflows?per_page=100&page=${page}`);
-      const batch = listed2 && Array.isArray(listed2.workflows) ? listed2.workflows : [];
-      seen += batch.length;
-      for (const w of batch) if (w && w.id != null && typeof w.name === "string") workflowNames.set(w.id, w.name);
-      const total2 = listed2 && Number.isFinite(listed2.total_count) ? listed2.total_count : Infinity;
-      if (batch.length < 100 || seen >= total2 || [...wantedIds].every((id) => workflowNames.has(id))) break;
-    }
-  } catch (e) {
-    if (e instanceof RateLimitError) throw e;
-  }
-  const byWf = groupRuns(runs, workflowNames);
-  const wanted = only.map((n) => String(n).trim().toLowerCase()).filter(Boolean);
-  const ranked = [...byWf.entries()].sort((a, b) => b[1].length - a[1].length);
-  const namesOf = (label, rs) => /* @__PURE__ */ new Set([String(label).toLowerCase(), ...rs.map((r) => String(r.name).toLowerCase())]);
-  const matches = (label, rs, n) => namesOf(label, rs).has(String(n).trim().toLowerCase());
-  const top = wanted.length ? ranked.filter(([label, rs]) => wanted.some((n) => matches(label, rs, n))) : ranked.slice(0, workflows);
-  const onlyMissing = wanted.length ? only.filter((n) => String(n).trim() && !ranked.some(([label, rs]) => matches(label, rs, n))) : [];
-  const samples = /* @__PURE__ */ new Map();
-  const outcomeSamples = /* @__PURE__ */ new Map();
-  const rawJobs = /* @__PURE__ */ new Map();
-  const jobsRaw = (r) => {
-    if (!rawJobs.has(r.id)) {
-      rawJobs.set(r.id, (async () => {
-        const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100&page=${page}`;
-        const first2 = await client.get(url(1));
-        if (!first2) return null;
-        const jobs = [...first2.jobs || []];
-        const total2 = Number.isFinite(first2.total_count) ? first2.total_count : jobs.length;
-        const pages = Math.min(10, Math.ceil(total2 / 100));
-        if (pages > 1) {
-          const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
-          for (const d of rest) if (d) jobs.push(...d.jobs || []);
-        }
-        return { ...first2, jobs, complete: jobs.length >= total2 };
-      })());
-    }
-    return rawJobs.get(r.id);
-  };
-  const jobsOf2 = async (r) => {
-    const j = await jobsRaw(r);
-    return j ? (j.jobs || []).filter((x) => x.started_at && x.completed_at && x.conclusion !== "skipped") : null;
-  };
-  const samplePaths = [...new Set(top.map(([, rs]) => String(rs[0].path || "").split("@")[0]).filter((p) => p.startsWith(".github/workflows/")))];
-  const sampleTextsP = Promise.all(samplePaths.map((path) => settle(client.getRaw(`repos/${repo}/contents/${encodePath(path)}`))));
-  const timed = await Promise.all(top.map(async ([wf, rs], n) => {
-    onProgress(`timing ${wf} (${n + 1}/${top.length})`);
-    const ok = rs.filter((r) => r.status === "completed" && r.conclusion === "success").slice(0, perWorkflow);
-    const outcomes = ["failure", "cancelled", "timed_out"].map((outcome) => [outcome, rs.filter((r) => r.status === "completed" && r.conclusion === outcome).slice(0, perOutcome)]);
-    const [okJobs, ...outcomeJobs] = await Promise.all([
-      Promise.all(ok.map(jobsOf2)),
-      ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf2)))
-    ]);
-    const byOutcome = {};
-    outcomes.forEach(([outcome], i) => {
-      const got = outcomeJobs[i].filter(Boolean);
-      if (got.length) byOutcome[outcome] = got;
-    });
-    return [wf, okJobs.filter(Boolean), byOutcome];
-  }));
-  for (const [wf, jobsPerRun, byOutcome] of timed) {
-    samples.set(wf, jobsPerRun);
-    outcomeSamples.set(wf, byOutcome);
-  }
-  onProgress("reading workflow files");
-  const files = /* @__PURE__ */ new Map();
-  const fileReads = /* @__PURE__ */ new Map();
-  const sampleTexts = await Promise.all((await sampleTextsP).map((r) => settled(Promise.resolve(r))));
-  samplePaths.forEach((path, i) => {
-    const text = sampleTexts[i];
-    fileReads.set(path, typeof text === "string" ? text : null);
-    files.set(path, text || "");
-  });
-  onProgress("scanning workflow files");
-  const [listing, meta, rootListing] = await Promise.all([settled(early.listing), settled(early.meta), settled(early.root)]);
-  const workflowPaths = (Array.isArray(listing) ? listing : []).filter((x) => x && x.type === "file" && /\.ya?ml$/i.test(String(x.name || ""))).map((x) => `.github/workflows/${x.name}`).sort();
-  const listed = Array.isArray(listing);
-  const scanFiles = /* @__PURE__ */ new Map();
-  const unreadable = [];
-  const candidates = listed ? workflowPaths : [...files.keys()];
-  const toScan = candidates.slice(0, maxScanFiles);
-  const scanTexts = await Promise.all(toScan.map((path) => {
-    const known = fileReads.get(path);
-    return known !== void 0 ? known : client.getRaw(`repos/${repo}/contents/${encodePath(path)}`);
-  }));
-  toScan.forEach((path, i) => {
-    if (typeof scanTexts[i] === "string") scanFiles.set(path, scanTexts[i]);
-    else unreadable.push(path);
-  });
-  const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
-  const defaultBranch = meta && typeof meta.default_branch === "string" ? meta.default_branch : null;
-  const visibility = meta && typeof meta.visibility === "string" ? meta.visibility : meta && typeof meta.private === "boolean" ? meta.private ? "private" : "public" : null;
-  const root = rootListing || [];
-  const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
-  const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
-  onProgress("reading merge gates");
-  const gates = await collectGates(client, repo, { runs, byWf, defaultBranch, rootNames: Array.isArray(rootListing) ? names : null, jobsRaw, settle, settled });
-  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
-}
-var PR_EVENTS = /* @__PURE__ */ new Set(["pull_request", "pull_request_target", "merge_group"]);
-var RENOVATE_FILES = ["renovate.json", "renovate.json5", ".renovaterc", ".renovaterc.json", ".renovaterc.json5"];
-async function collectGates(client, repo, { runs, byWf, defaultBranch, rootNames, jobsRaw, settle, settled }) {
-  const soft = async (p) => {
-    try {
-      return { ok: true, value: await settled(settle(p)) };
-    } catch (e) {
-      if (e instanceof RateLimitError) throw e;
-      return { ok: false, value: null };
-    }
-  };
-  const branch = defaultBranch ? encodeURIComponent(defaultBranch) : null;
-  const prRuns = [];
-  let unfinishedOnly = false;
-  for (const rs of byWf.values()) {
-    const done = rs.find((r) => PR_EVENTS.has(r.event) && r.status === "completed");
-    const any = done || rs.find((r) => PR_EVENTS.has(r.event));
-    if (!any) continue;
-    prRuns.push(any);
-    if (!done) unfinishedOnly = true;
-  }
-  const [rules, branchInfo, githubDir, ...prJobLists] = await Promise.all([
-    branch ? soft(client.get(`repos/${repo}/rules/branches/${branch}?per_page=100`)) : { ok: false, value: null },
-    branch ? soft(client.get(`repos/${repo}/branches/${branch}`)) : { ok: false, value: null },
-    soft(client.get(`repos/${repo}/contents/.github`)),
-    ...prRuns.map((r) => soft(jobsRaw(r)))
-  ]);
-  let required = null;
-  const rulesRead = rules.ok && Array.isArray(rules.value);
-  const protection = branchInfo.ok && branchInfo.value ? branchInfo.value.protection : void 0;
-  const classicRead = protection !== void 0 && protection !== null;
-  if (rulesRead || classicRead) {
-    const seen = /* @__PURE__ */ new Map();
-    const add = (context, integrationId) => {
-      if (typeof context !== "string" || !context) return;
-      const key = `${context}\0${integrationId ?? ""}`;
-      if (!seen.has(key)) seen.set(key, { context, integrationId: integrationId ?? null });
-    };
-    if (rulesRead) {
-      for (const rule of rules.value) {
-        if (rule && rule.type === "required_status_checks") {
-          for (const c of rule.parameters && rule.parameters.required_status_checks || []) add(c && c.context, c && c.integration_id);
-        }
-      }
-    }
-    if (classicRead && protection.enabled !== false) {
-      const rsc = protection.required_status_checks || {};
-      if (rsc.enforcement_level !== "off") {
-        for (const c of rsc.contexts || []) add(c, null);
-        for (const c of rsc.checks || []) add(c && c.context, c && c.app_id);
-      }
-    }
-    required = [...seen.values()];
-  }
-  const requiredComplete = rulesRead && classicRead;
-  const prChecks = /* @__PURE__ */ new Set();
-  let prJobsRead = 0;
-  let prJobsComplete = prRuns.length > 0 && !unfinishedOnly;
-  prJobLists.forEach((r) => {
-    if (r.ok && r.value && Array.isArray(r.value.jobs)) {
-      prJobsRead += 1;
-      if (r.value.complete === false) prJobsComplete = false;
-      for (const j of r.value.jobs) if (j && typeof j.name === "string") prChecks.add(j.name);
-    } else {
-      prJobsComplete = false;
-    }
-  });
-  const codeScanningRuns = runs.some((r) => String(r.path || "").startsWith("dynamic/github-code-scanning"));
-  const dependabotRuns = runs.some((r) => String(r.path || "").startsWith("dynamic/dependabot"));
-  const ghNames = githubDir.ok && Array.isArray(githubDir.value) ? new Set(githubDir.value.map((x) => x && x.name)) : null;
-  const dependabotFile = ghNames ? ghNames.has("dependabot.yml") || ghNames.has("dependabot.yaml") : null;
-  const renovateFile = ghNames && rootNames ? RENOVATE_FILES.some((f) => rootNames.has(f) || ghNames.has(f)) : null;
-  return {
-    branch: defaultBranch,
-    required,
-    required_complete: requiredComplete,
-    pr_runs_seen: prRuns.length,
-    pr_runs_read: prJobsRead,
-    pr_jobs_complete: prJobsComplete,
-    pr_checks: [...prChecks].sort(),
-    code_scanning_runs: codeScanningRuns,
-    dependency_updates: dependabotRuns || dependabotFile || renovateFile ? true : dependabotFile === null || renovateFile === null ? null : false
   };
 }
 
@@ -8566,6 +8332,12 @@ function workflowFacts(doc) {
     checkout
   };
 }
+function runsOnSelfHosted(runsOn) {
+  if (runsOn === void 0 || runsOn === null) return false;
+  if (Array.isArray(runsOn)) return runsOn.some((l) => /self-hosted/i.test(String(l)));
+  if (typeof runsOn === "object") return Array.isArray(runsOn.labels) ? runsOn.labels.some((l) => /self-hosted/i.test(String(l))) : /self-hosted/i.test(String(runsOn.labels || ""));
+  return /self-hosted/i.test(String(runsOn));
+}
 function picksSelfHosted(value, raw) {
   const mentions = /self-hosted/i.test(typeof raw === "string" ? raw : JSON.stringify(raw ?? ""));
   if (value === UNKNOWN) return mentions ? null : false;
@@ -8692,6 +8464,731 @@ function assignJobRuns(fileJobNames, apiNames) {
     out.get(hits[0].key).push(api);
   }
   return out;
+}
+
+// src/trim.mjs
+var TEST_RUNNERS = [
+  /^node --test\b/,
+  /^(npm|pnpm|yarn|bun) (run )?(test|t)\b/,
+  /^(npx |pnpm exec |pnpm dlx |yarn )?(jest|vitest|mocha|ava|tap|uvu)\b/,
+  /^(python3? -m )?pytest\b/,
+  /^(python3? -m )?unittest\b/,
+  /^go test\b/,
+  /^cargo (test|nextest run)\b/,
+  /^(bundle exec )?rspec\b/,
+  /^dotnet test\b/,
+  /^(mvn|\.\/mvnw) (verify|test)\b/,
+  /^(gradle|\.\/gradlew) (test|check)\b/,
+  /^make (test|check)\b/,
+  /^ctest\b/,
+  /^(vendor\/bin\/)?(phpunit|pest)\b/
+];
+var REPORTING_WITH_VALUE = /^--(test-reporter(-destination)?|reporter)(=|$)/;
+var REPORTING_FLAG = /^(--(quiet|verbose|silent|no-color|color)|-(q|v|vv))$/;
+function testWords(words) {
+  const ws = [...words];
+  while (ws.length && KEYWORDS.has(ws[0])) ws.shift();
+  if (!TEST_RUNNERS.some((rx) => rx.test(ws.join(" ")))) return null;
+  const out = [];
+  const forwards = ws[0] === "npm";
+  let literal = false;
+  let separators = 0;
+  for (let k = 0; k < ws.length; k++) {
+    const w = ws[k];
+    if (literal) {
+      out.push(w);
+      continue;
+    }
+    if (w === "--") {
+      separators++;
+      if (!forwards || separators > 1) literal = true;
+      out.push(w);
+      continue;
+    }
+    if (REPORTING_WITH_VALUE.test(w)) {
+      if (!w.includes("=")) k++;
+      continue;
+    }
+    if (REPORTING_FLAG.test(w)) continue;
+    out.push(w);
+  }
+  if (out.length && out[out.length - 1] === "--") out.pop();
+  return out;
+}
+var KEY_SEP = "";
+var toKey = (words) => words.join(KEY_SEP);
+function commandOfKey(key) {
+  return String(key).split(KEY_SEP).join(" ");
+}
+function survivesFailure(condition) {
+  return /^(\$\{\{\s*)?(always\(\)|!\s*cancelled\(\))(\s*\}\})?$/.test(String(condition ?? "").trim());
+}
+var HARMLESS = /* @__PURE__ */ new Set(["echo", "true", ":", "pwd"]);
+function setsOptionsOnly(words) {
+  const rest = words.slice(1);
+  if (!rest.length) return false;
+  for (let k = 0; k < rest.length; k++) {
+    const w = rest[k];
+    if (/^[-+][eux]+$/.test(w)) continue;
+    if (/^[-+][eux]*o$/.test(w)) {
+      if (!/^(pipefail|errexit|nounset|xtrace)$/.test(rest[k + 1] ?? "")) return false;
+      k++;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+var KEYWORDS = /* @__PURE__ */ new Set(["then", "do", "else", "elif", "{", "(", "!", "time", "exec"]);
+function testCommands(script) {
+  return testCommandKeys(script).map(commandOfKey);
+}
+function testCommandKeys(script) {
+  const out = [];
+  for (const words of shellCommands(script)) {
+    const ws = testWords(words);
+    if (ws) out.push(toKey(ws));
+  }
+  return out;
+}
+function onlyCommand(script, command) {
+  if (/\||\$|`|<|>\(|\\/.test(String(script))) return false;
+  if (/['"]/.test(String(script)) && /[{}*?[\]~]/.test(String(script))) return false;
+  const commands = shellCommands(script);
+  if (!commands.length) return false;
+  let hits = 0;
+  const wanted = commandOfKey(command);
+  for (const words of commands) {
+    const ws = [...words];
+    while (ws.length && KEYWORDS.has(ws[0])) ws.shift();
+    if (!ws.length) continue;
+    const tw = testWords(ws);
+    if (tw) {
+      if (tw.join(" ") !== wanted) return false;
+      hits++;
+      continue;
+    }
+    if (ws[0] === "set") {
+      if (!setsOptionsOnly(ws)) return false;
+      continue;
+    }
+    if (!HARMLESS.has(ws[0]) || ws.some((w) => w.includes("$") || /^(<|>|>>|\|)/.test(w) || /[<>|]/.test(w) && !/^['"]/.test(w) && w !== ws[0])) return false;
+  }
+  return hits > 0;
+}
+function jobsOf(doc) {
+  return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object");
+}
+function stepsOf(job) {
+  return Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
+}
+function stepName(st, i = 0) {
+  if (st.name) return String(st.name).trim();
+  if (st.uses) return `Run ${st.uses}`;
+  if (st.run !== void 0) return `Run ${String(st.run).trim().split("\n")[0]}`;
+  return `step ${i + 1}`;
+}
+function logHeader(st) {
+  if (st.run === void 0) return null;
+  return String(st.run).trim().split("\n")[0].trim();
+}
+function repeatedTests(doc) {
+  const found = [];
+  const byCommand = /* @__PURE__ */ new Map();
+  const used = /* @__PURE__ */ new Set();
+  const key = (job, index) => `${job}\0${index}`;
+  const text = (x) => JSON.stringify(x ?? null);
+  const cond = (x) => String(x?.if ?? "").replace(/\s+/g, " ").trim();
+  const dirOf = (st, job) => String(st["working-directory"] ?? job.defaults?.run?.["working-directory"] ?? doc.defaults?.run?.["working-directory"] ?? "").trim();
+  const shown = (x) => String(x).replace(/\s+/g, " ").trim();
+  for (const [id, job] of jobsOf(doc)) {
+    const inJob = /* @__PURE__ */ new Map();
+    const all = stepsOf(job);
+    all.forEach((st, i) => {
+      if (st.run === void 0) return;
+      const keys = new Set(testCommandKeys(st.run));
+      if (keys.size !== 1) return;
+      const [key2] = keys;
+      if (!onlyCommand(st.run, key2)) return;
+      const stepKey = [key2, cond(st), dirOf(st, job), text(st.env), text(st.shell)].join("\0");
+      if (stepKey.includes("${{")) return;
+      if (!inJob.has(stepKey)) inJob.set(stepKey, []);
+      const name = stepName(st, i);
+      const shared = name.includes("${{") || all.filter((x, k) => shown(stepName(x, k)) === shown(name)).length > 1;
+      inJob.get(stepKey).push({ index: i, name, header: logHeader(st), command: commandOfKey(key2), script: String(st.run).trim(), shared });
+    });
+    for (const [stepKey, steps] of inJob) {
+      const runs = [];
+      for (const o of steps) {
+        const last = runs[runs.length - 1];
+        if (last && o.index === last[last.length - 1].index + 1) last.push(o);
+        else runs.push([o]);
+      }
+      for (const run of runs) {
+        if (run.length > 1) {
+          found.push({ scope: "job", jobs: [id], steps: run.map((o) => o.name), headers: run.map((o) => o.header), shared: run.map((o) => o.shared), command: run[0].command, script: run[0].script });
+          for (const o of run) used.add(key(id, o.index));
+        }
+      }
+      const first = steps[0];
+      const before = text(all.slice(0, first.index).map((st) => ({ uses: st.uses ?? null, run: st.run ?? null, with: st.with ?? null, env: st.env ?? null, if: st.if ?? null, dir: st["working-directory"] ?? null, shell: st.shell ?? null })));
+      const jobKey = [stepKey, text(job["runs-on"]), text(job.environment), text(job.env), text(job.container), text(job.services), text(job.defaults), cond(job), before].join("\0");
+      if (jobKey.includes("${{")) continue;
+      if (!byCommand.has(jobKey)) byCommand.set(jobKey, []);
+      byCommand.get(jobKey).push({ job: id, step: first.name, header: first.header, shared: first.shared, index: first.index, command: first.command, script: first.script, matrix: Boolean(job.strategy && job.strategy.matrix) });
+    }
+  }
+  for (const where2 of byCommand.values()) {
+    const ws = where2.filter((w) => !w.matrix && !used.has(key(w.job, w.index)));
+    if (ws.length > 1) {
+      found.push({ scope: "workflow", jobs: ws.map((w) => w.job), steps: ws.map((w) => w.step), headers: ws.map((w) => w.header), shared: ws.map((w) => w.shared), command: ws[0].command, script: ws[0].script });
+      for (const w of ws) used.add(key(w.job, w.index));
+    }
+  }
+  return found;
+}
+function artifactNameOf(st) {
+  const w = st.with && typeof st.with === "object" ? st.with : {};
+  const name = w.name === void 0 || w.name === null ? "artifact" : String(w.name).trim();
+  return name.includes("${{") ? null : name;
+}
+function duplicateUploads(doc) {
+  const found = [];
+  let consumesAll = false;
+  const consumed = /* @__PURE__ */ new Set();
+  for (const [, job] of jobsOf(doc)) {
+    for (const st of stepsOf(job)) {
+      if (!/^actions\/download-artifact@/.test(String(st.uses || ""))) continue;
+      const w = st.with && typeof st.with === "object" ? st.with : {};
+      const name = w.name === void 0 || w.name === null ? "" : String(w.name).trim();
+      if (!name || name.includes("${{") || w.pattern !== void 0) consumesAll = true;
+      else consumed.add(name);
+    }
+  }
+  if (consumesAll) return found;
+  for (const [id, job] of jobsOf(doc)) {
+    const steps = stepsOf(job);
+    steps.forEach((st, i) => {
+      if (!/^actions\/upload-artifact@/.test(String(st.uses || ""))) return;
+      const artifactName = artifactNameOf(st);
+      if (artifactName === null || consumed.has(artifactName)) return;
+      if (/failure\(\)|always\(\)|cancelled\(\)/.test(String(st.if ?? ""))) return;
+      const raw = st.with && typeof st.with === "object" ? String(st.with.path ?? "") : "";
+      const paths = raw.split("\n").map((p) => p.trim()).filter(Boolean);
+      if (paths.length !== 1 || /[*?[]/.test(paths[0]) || paths[0].includes("${{")) return;
+      const path = paths[0].replace(/^\.\//, "");
+      if (!/\.[A-Za-z0-9]+$/.test(path) || path.endsWith("/")) return;
+      const alsoTo = /* @__PURE__ */ new Set();
+      const same = (p) => String(p ?? "").split("\n").map((x) => x.trim().replace(/^\.\//, "")).includes(path);
+      const guard = (s) => String(s.if ?? "").replace(/\s+/g, " ").trim();
+      if (guard(st) !== "") return;
+      let after = false;
+      steps.forEach((other, j) => {
+        if (j === i) return;
+        if (guard(other) !== "" && !survivesFailure(guard(other))) return;
+        if (other["continue-on-error"] !== void 0 && String(other["continue-on-error"]).trim().toLowerCase() !== "false") return;
+        if (Math.abs(j - i) !== 1) return;
+        const uses = String(other.uses || "");
+        const w = other.with && typeof other.with === "object" ? other.with : {};
+        const overwrites = w.overwrite_files === void 0 || w.overwrite_files === null || String(w.overwrite_files).trim().toLowerCase() === "true";
+        const hit = /^github\/codeql-action\/upload-sarif@/.test(uses) && same(w.sarif_file) ? "code scanning" : /^softprops\/action-gh-release@/.test(uses) && same(w.files) && overwrites ? "the release" : null;
+        if (!hit) return;
+        alsoTo.add(hit);
+        if (j > i) after = true;
+      });
+      if (alsoTo.size) found.push({ job: id, step: stepName(st, i), path, name: artifactNameOf(st), alsoTo: [...alsoTo], after });
+    });
+  }
+  return found;
+}
+function stepSections(logText) {
+  const sections = [];
+  let cur = null;
+  for (const raw of String(logText).split(/\r?\n/)) {
+    const line = raw.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?/, "").replace(/\u001b\[[0-9;]*m/g, "");
+    const m = /^##\[group\]Run (.*)$/.exec(line);
+    if (m) {
+      cur = { header: m[1].trim(), lines: [] };
+      sections.push(cur);
+      continue;
+    }
+    if (cur) cur.lines.push(line);
+  }
+  return sections.map((s) => ({ header: s.header, text: s.lines.join("\n") }));
+}
+var NAME_LINES = [
+  /^\s*(?:ok|not ok) \d+ - (.+?)(?: # (?:SKIP|TODO)\b.*)?$/,
+  /^\s*--- (?:PASS|FAIL|SKIP): (\S+)/,
+  /^(\S+::\S+) (?:PASSED|FAILED|SKIPPED|XFAIL|XPASS)\b/,
+  /^\s*[✓✔√] (.+?)(?: \(\d+ ?m?s\))?$/
+];
+var COUNT_LINES = [
+  { rx: /^# tests (\d+)$/, whole: true },
+  // node --test's TAP summary
+  { rx: /^Tests:\s+(?:.*?, )?(\d+) total/, whole: true },
+  // jest
+  { rx: /^\s*Tests\s+(?:.*?\| )?\d+ \w+ \((\d+)\)/, whole: true },
+  // vitest: "Tests  12 passed (12)"
+  { rx: /^=+ (\d+ \w+(?:, \d+ \w+)*) in [\d.]+s(?: \([^)]*\))? =+$/, whole: true, pytest: true },
+  // pytest: every outcome counted, warnings not
+  { rx: /^\s*(\d+) passing\b/, whole: true },
+  // mocha
+  { rx: /^test result: \w+\. (\d+) passed; (\d+) failed/, whole: false, both: true },
+  // cargo test, one line per binary
+  { rx: /^\[INFO\] Tests run: (\d+), Failures: \d+, Errors: \d+, Skipped: \d+$/, whole: true },
+  // maven's total (a per-class line carries "-- in <class>")
+  { rx: /^OK \((\d+) tests?/, whole: true },
+  // phpunit
+  { rx: /^(\d+) examples?, \d+ failures?/, whole: true },
+  // rspec
+  { rx: /^\s*Passed!\s+-\s+Failed:\s+\d+,\s+Passed:\s+\d+,\s+Skipped:\s+\d+,\s+Total:\s+(\d+)/, whole: false }
+  // dotnet test, one line per project
+];
+function pytestCount(summary2) {
+  let n = 0;
+  for (const m of summary2.matchAll(/(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)\b/g)) n += Number(m[1]);
+  return n;
+}
+function testSignature(sectionText) {
+  const names = [];
+  let whole = null;
+  let wholes = 0;
+  let parts = 0;
+  let hasParts = false;
+  for (const line of String(sectionText).split("\n")) {
+    for (const rx of NAME_LINES) {
+      const m = rx.exec(line);
+      if (m) {
+        names.push(m[1].trim());
+        break;
+      }
+    }
+    for (const c of COUNT_LINES) {
+      const m = c.rx.exec(line);
+      if (!m) continue;
+      const n = c.pytest ? pytestCount(m[1]) : c.both ? Number(m[1]) + Number(m[2]) : Number(m[1]);
+      if (c.whole) {
+        wholes++;
+        whole = n;
+      } else {
+        hasParts = true;
+        parts += n;
+      }
+      break;
+    }
+  }
+  const count = wholes > 1 || wholes === 1 && hasParts ? null : wholes === 1 ? whole : hasParts ? parts : null;
+  if (names.length) return { names, count: names.length };
+  if (count !== null && count > 0) return { names: null, count };
+  return null;
+}
+function sameTests(a, b) {
+  if (!a || !b) return null;
+  if (a.names && b.names) {
+    const sorted = (xs) => [...xs].sort().join("\n");
+    return { same: a.names.length === b.names.length && sorted(a.names) === sorted(b.names), by: "name", count: a.names.length };
+  }
+  if (a.count > 0 && b.count > 0) return { same: a.count === b.count, by: "count", count: a.count };
+  return null;
+}
+function signaturesOf(logText, headers) {
+  const sections = stepSections(logText);
+  const wanted = /* @__PURE__ */ new Map();
+  for (const h of headers) {
+    if (h === null || h === void 0) return null;
+    wanted.set(h, (wanted.get(h) || 0) + 1);
+  }
+  for (const [h, n] of wanted) if (sections.filter((s) => s.header === h).length !== n) return null;
+  const taken = /* @__PURE__ */ new Map();
+  return headers.map((h) => {
+    const k = taken.get(h) || 0;
+    taken.set(h, k + 1);
+    return testSignature(sections.filter((s) => s.header === h)[k].text);
+  });
+}
+function startsTests(doc) {
+  return jobsOf(doc).some(([, job]) => stepsOf(job).some((st) => st.run !== void 0 && testCommands(st.run).length > 0));
+}
+function selfHostedSetups(doc) {
+  const found = [];
+  for (const [id, job] of jobsOf(doc)) {
+    if (!runsOnSelfHosted(job["runs-on"]) || JSON.stringify(job["runs-on"] ?? null).includes("${{")) continue;
+    if (job.container !== void 0 && job.container !== null) continue;
+    stepsOf(job).forEach((st, i) => {
+      const m = /^actions\/setup-(node|python|go|dotnet|ruby)@/.exec(String(st.uses || ""));
+      if (!m) return;
+      const w = st.with && typeof st.with === "object" ? st.with : {};
+      const off = (k) => String(w[k] ?? "").trim().toLowerCase() === "false";
+      if (Object.keys(w).some((k) => /^(cache|cache-dependency-path|bundler-cache|registry-url|scope|always-auth|server-id|server-username|server-password|gpg-private-key|source-url|package-manager-cache)$/.test(k) && !((k === "cache" || k === "package-manager-cache") && off(k)))) return;
+      if (m[1] === "go" && !off("cache")) return;
+      const major = /@v(\d+)(\.|$)/.exec(String(st.uses));
+      if (m[1] === "node" && !(major && Number(major[1]) <= 4) && !off("package-manager-cache")) return;
+      const name = stepName(st, i);
+      const shown = (x) => String(x).replace(/\s+/g, " ").trim();
+      const unique = !name.includes("${{") && stepsOf(job).filter((x, k) => shown(stepName(x, k)) === shown(name)).length === 1;
+      found.push({ job: id, step: name, action: `setup-${m[1]}`, unique });
+    });
+  }
+  return found;
+}
+
+// src/zip.mjs
+var EOCD = 101010256;
+var CENTRAL = 33639248;
+function zipEntries(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 22) return null;
+  const floor = Math.max(0, buf.length - 22 - 65535);
+  let at = -1;
+  for (let i = buf.length - 22; i >= floor; i--) {
+    if (buf.readUInt32LE(i) === EOCD) {
+      at = i;
+      break;
+    }
+  }
+  if (at < 0) return null;
+  const count = buf.readUInt16LE(at + 10);
+  const size = buf.readUInt32LE(at + 12);
+  const offset = buf.readUInt32LE(at + 16);
+  if (count === 65535 || size === 4294967295 || offset === 4294967295) return null;
+  if (offset + size > at) return null;
+  const entries = [];
+  let p = offset;
+  for (let n = 0; n < count; n++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== CENTRAL) return null;
+    const uncompressed = buf.readUInt32LE(p + 24);
+    const nameLength = buf.readUInt16LE(p + 28);
+    const extraLength = buf.readUInt16LE(p + 30);
+    const commentLength = buf.readUInt16LE(p + 32);
+    if (p + 46 + nameLength > buf.length) return null;
+    entries.push({ name: buf.toString("utf8", p + 46, p + 46 + nameLength), size: uncompressed });
+    p += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+// src/collect.mjs
+var encodePath = (path) => String(path).split("/").map(encodeURIComponent).join("/");
+var LOCKFILES = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum", "Cargo.lock", "Gemfile.lock"];
+function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const r of runs) {
+    const key = r.workflow_id != null ? `id:${r.workflow_id}` : r.path ? `path:${String(r.path).split("@")[0]}` : `name:${r.name}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  const labelled = [...groups.values()].map((rs) => {
+    const counts = /* @__PURE__ */ new Map();
+    for (const r of rs) counts.set(r.name, (counts.get(r.name) || 0) + 1);
+    const best = Math.max(...counts.values());
+    const known = rs[0].workflow_id != null ? names.get(rs[0].workflow_id) : void 0;
+    const name = typeof known === "string" && known ? known : String(rs.find((r) => counts.get(r.name) === best).name);
+    return { name, path: String(rs[0].path || "").split("@")[0], rs };
+  });
+  const taken = /* @__PURE__ */ new Map();
+  for (const g of labelled) taken.set(g.name, (taken.get(g.name) || 0) + 1);
+  const out = /* @__PURE__ */ new Map();
+  for (const g of labelled) out.set(taken.get(g.name) > 1 && g.path ? `${g.name} (${g.path})` : g.name, g.rs);
+  return out;
+}
+async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, logs = true, artifacts = true, maxLogBytes = 8 * 1048576, maxArtifactBytes = 8 * 1048576, onProgress = () => {
+} } = {}) {
+  const since = new Date(now.getTime() - days * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const runs = [];
+  let truncated = false;
+  onProgress("reading workflow runs");
+  const runsPage = (page) => client.get(`repos/${repo}/actions/runs?per_page=100&page=${page}&created=${encodeURIComponent(">=" + since)}`);
+  const first = await runsPage(1);
+  if (!first) throw new NotFoundError(repo);
+  runs.push(...first.workflow_runs || []);
+  if (!runs.length) return null;
+  const total = Number.isFinite(first.total_count) ? first.total_count : null;
+  const settle = (p) => p.then((value) => ({ value }), (error) => ({ error }));
+  const settled = async (p) => {
+    const r = await p;
+    if (r.error) throw r.error;
+    return r.value;
+  };
+  const early = {
+    listing: settle(client.get(`repos/${repo}/contents/.github/workflows`)),
+    meta: settle(client.get(`repos/${repo}`)),
+    root: settle(client.get(`repos/${repo}/contents`)),
+    workflows: settle(client.get(`repos/${repo}/actions/workflows?per_page=100&page=1`))
+  };
+  if ((first.workflow_runs || []).length === 100 && maxPages > 1) {
+    if (total !== null) {
+      const pages = Math.min(maxPages, Math.ceil(total / 100));
+      const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => runsPage(i + 2)));
+      for (const d of rest) if (d) runs.push(...d.workflow_runs || []);
+      truncated = total > maxPages * 100;
+    } else {
+      for (let page = 2; page <= maxPages; page++) {
+        const d = await runsPage(page);
+        if (!d) break;
+        const batch = d.workflow_runs || [];
+        runs.push(...batch);
+        if (batch.length < 100) break;
+        if (page === maxPages) truncated = true;
+      }
+    }
+  } else if ((first.workflow_runs || []).length === 100 && maxPages === 1) {
+    truncated = total === null || total > 100;
+  }
+  const seenRuns = /* @__PURE__ */ new Set();
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const id = runs[i] && runs[i].id;
+    if (id == null) continue;
+    if (seenRuns.has(id)) runs.splice(i, 1);
+    else seenRuns.add(id);
+  }
+  if (!runs.length) return null;
+  const oldest = Math.min(...runs.map((r) => Date.parse(r.created_at)));
+  const coveredDays = truncated ? Math.max(0.25, (now.getTime() - oldest) / 864e5) : days;
+  const workflowNames = /* @__PURE__ */ new Map();
+  const wantedIds = new Set(runs.map((r) => r.workflow_id).filter((id) => id != null));
+  try {
+    for (let page = 1, seen = 0; ; page++) {
+      const listed2 = page === 1 ? await settled(early.workflows) : await client.get(`repos/${repo}/actions/workflows?per_page=100&page=${page}`);
+      const batch = listed2 && Array.isArray(listed2.workflows) ? listed2.workflows : [];
+      seen += batch.length;
+      for (const w of batch) if (w && w.id != null && typeof w.name === "string") workflowNames.set(w.id, w.name);
+      const total2 = listed2 && Number.isFinite(listed2.total_count) ? listed2.total_count : Infinity;
+      if (batch.length < 100 || seen >= total2 || [...wantedIds].every((id) => workflowNames.has(id))) break;
+    }
+  } catch (e) {
+    if (e instanceof RateLimitError) throw e;
+  }
+  const byWf = groupRuns(runs, workflowNames);
+  const wanted = only.map((n) => String(n).trim().toLowerCase()).filter(Boolean);
+  const ranked = [...byWf.entries()].sort((a, b) => b[1].length - a[1].length);
+  const namesOf = (label, rs) => /* @__PURE__ */ new Set([String(label).toLowerCase(), ...rs.map((r) => String(r.name).toLowerCase())]);
+  const matches = (label, rs, n) => namesOf(label, rs).has(String(n).trim().toLowerCase());
+  const top = wanted.length ? ranked.filter(([label, rs]) => wanted.some((n) => matches(label, rs, n))) : ranked.slice(0, workflows);
+  const onlyMissing = wanted.length ? only.filter((n) => String(n).trim() && !ranked.some(([label, rs]) => matches(label, rs, n))) : [];
+  const samples = /* @__PURE__ */ new Map();
+  const outcomeSamples = /* @__PURE__ */ new Map();
+  const rawJobs = /* @__PURE__ */ new Map();
+  const jobsRaw = (r) => {
+    if (!rawJobs.has(r.id)) {
+      rawJobs.set(r.id, (async () => {
+        const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100&page=${page}`;
+        const first2 = await client.get(url(1));
+        if (!first2) return null;
+        const jobs = [...first2.jobs || []];
+        const total2 = Number.isFinite(first2.total_count) ? first2.total_count : jobs.length;
+        const pages = Math.min(10, Math.ceil(total2 / 100));
+        if (pages > 1) {
+          const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
+          for (const d of rest) if (d) jobs.push(...d.jobs || []);
+        }
+        return { ...first2, jobs, complete: jobs.length >= total2 };
+      })());
+    }
+    return rawJobs.get(r.id);
+  };
+  const jobsOf3 = async (r) => {
+    const j = await jobsRaw(r);
+    return j ? (j.jobs || []).filter((x) => x.started_at && x.completed_at && x.conclusion !== "skipped") : null;
+  };
+  const samplePaths = [...new Set(top.map(([, rs]) => String(rs[0].path || "").split("@")[0]).filter((p) => p.startsWith(".github/workflows/")))];
+  const sampleTextsP = Promise.all(samplePaths.map((path) => settle(client.getRaw(`repos/${repo}/contents/${encodePath(path)}`))));
+  const timed = await Promise.all(top.map(async ([wf, rs], n) => {
+    onProgress(`timing ${wf} (${n + 1}/${top.length})`);
+    const ok = rs.filter((r) => r.status === "completed" && r.conclusion === "success").slice(0, perWorkflow);
+    const outcomes = ["failure", "cancelled", "timed_out"].map((outcome) => [outcome, rs.filter((r) => r.status === "completed" && r.conclusion === outcome).slice(0, perOutcome)]);
+    const [okJobs, ...outcomeJobs] = await Promise.all([
+      Promise.all(ok.map(jobsOf3)),
+      ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf3)))
+    ]);
+    const byOutcome = {};
+    outcomes.forEach(([outcome], i) => {
+      const got = outcomeJobs[i].filter(Boolean);
+      if (got.length) byOutcome[outcome] = got;
+    });
+    return [wf, okJobs.filter(Boolean), byOutcome];
+  }));
+  for (const [wf, jobsPerRun, byOutcome] of timed) {
+    samples.set(wf, jobsPerRun);
+    outcomeSamples.set(wf, byOutcome);
+  }
+  if (logs && typeof client.sizeOf === "function") {
+    onProgress("reading log sizes");
+    const newest = [...samples.values()].flatMap((jobsPerRun) => jobsPerRun[0] || []).filter((j) => j && j.id != null);
+    const sizes = await Promise.all(newest.map((j) => settle(client.sizeOf(`repos/${repo}/actions/jobs/${j.id}/logs`))));
+    newest.forEach((j, i) => {
+      const s = sizes[i];
+      if (s && Number.isFinite(s.value)) j.log_bytes = s.value;
+    });
+  }
+  onProgress("reading workflow files");
+  const files = /* @__PURE__ */ new Map();
+  const fileReads = /* @__PURE__ */ new Map();
+  const sampleTexts = await Promise.all((await sampleTextsP).map((r) => settled(Promise.resolve(r))));
+  samplePaths.forEach((path, i) => {
+    const text = sampleTexts[i];
+    fileReads.set(path, typeof text === "string" ? text : null);
+    files.set(path, text || "");
+  });
+  if ((logs || artifacts) && typeof client.fileOf === "function") {
+    const rethrow = (r) => {
+      if (r.error instanceof RateLimitError) throw r.error;
+      return r.value;
+    };
+    for (const [wf, rs] of top) {
+      const text = files.get(String(rs[0].path || "").split("@")[0]);
+      const newest = (samples.get(wf) || [])[0] || [];
+      if (!text || !newest.length) continue;
+      const doc = parseWorkflow(text);
+      if (logs) {
+        const assigned = assignJobRuns(allJobTimeouts(doc).map((t) => ({ id: t.id, name: t.name, reusable: Boolean(t.reusable) })), [...new Set(newest.map((j) => String(j.name || "")))]);
+        const wanted2 = /* @__PURE__ */ new Set();
+        for (const r of repeatedTests(doc)) {
+          for (const id of r.jobs) {
+            const names2 = assigned.get(id) || [];
+            if (names2.length !== 1) continue;
+            const js = newest.filter((j) => String(j.name || "") === names2[0] && j.id != null);
+            if (js.length === 1) wanted2.add(js[0]);
+          }
+        }
+        if (wanted2.size) {
+          onProgress(`reading step logs of ${wf}`);
+          const jobs = [...wanted2];
+          const texts = await Promise.all(jobs.map((j) => settle(client.fileOf(`repos/${repo}/actions/jobs/${j.id}/logs`, { max: maxLogBytes }))));
+          jobs.forEach((j, i) => {
+            const t = rethrow(texts[i]);
+            if (typeof t === "string") j.log_text = t;
+          });
+        }
+      }
+      if (artifacts) {
+        const names2 = new Set(duplicateUploads(doc).map((u) => u.name).filter((n) => n !== null));
+        const runId = (newest.find((j) => j.run_id != null) || {}).run_id;
+        if (names2.size && runId != null) {
+          onProgress(`reading artifacts of ${wf}`);
+          const listing2 = rethrow(await settle(client.get(`repos/${repo}/actions/runs/${runId}/artifacts?per_page=100`)));
+          const complete = listing2 && Array.isArray(listing2.artifacts) && !(Number.isFinite(listing2.total_count) && listing2.total_count > listing2.artifacts.length);
+          const listed2 = complete ? listing2.artifacts : null;
+          if (listed2) {
+            const picked = listed2.filter((a) => a && a.id != null && !a.expired && names2.has(String(a.name)));
+            const zips = await Promise.all(picked.map((a) => settle(client.fileOf(`repos/${repo}/actions/artifacts/${a.id}/zip`, { bytes: true, max: maxArtifactBytes }))));
+            const record = picked.map((a, i) => {
+              const zip = rethrow(zips[i]);
+              return { name: String(a.name), bytes: Number(a.size_in_bytes) || 0, entries: Buffer.isBuffer(zip) ? zipEntries(zip) : null };
+            });
+            for (const j of newest) j.run_artifacts = record;
+          }
+        }
+      }
+    }
+  }
+  onProgress("scanning workflow files");
+  const [listing, meta, rootListing] = await Promise.all([settled(early.listing), settled(early.meta), settled(early.root)]);
+  const workflowPaths = (Array.isArray(listing) ? listing : []).filter((x) => x && x.type === "file" && /\.ya?ml$/i.test(String(x.name || ""))).map((x) => `.github/workflows/${x.name}`).sort();
+  const listed = Array.isArray(listing);
+  const scanFiles = /* @__PURE__ */ new Map();
+  const unreadable = [];
+  const candidates = listed ? workflowPaths : [...files.keys()];
+  const toScan = candidates.slice(0, maxScanFiles);
+  const scanTexts = await Promise.all(toScan.map((path) => {
+    const known = fileReads.get(path);
+    return known !== void 0 ? known : client.getRaw(`repos/${repo}/contents/${encodePath(path)}`);
+  }));
+  toScan.forEach((path, i) => {
+    if (typeof scanTexts[i] === "string") scanFiles.set(path, scanTexts[i]);
+    else unreadable.push(path);
+  });
+  const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
+  const defaultBranch = meta && typeof meta.default_branch === "string" ? meta.default_branch : null;
+  const visibility = meta && typeof meta.visibility === "string" ? meta.visibility : meta && typeof meta.private === "boolean" ? meta.private ? "private" : "public" : null;
+  const root = rootListing || [];
+  const names = new Set((Array.isArray(root) ? root : []).map((x) => x && x.name));
+  const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
+  onProgress("reading merge gates");
+  const gates = await collectGates(client, repo, { runs, byWf, defaultBranch, rootNames: Array.isArray(rootListing) ? names : null, jobsRaw, settle, settled });
+  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
+}
+var PR_EVENTS = /* @__PURE__ */ new Set(["pull_request", "pull_request_target", "merge_group"]);
+var RENOVATE_FILES = ["renovate.json", "renovate.json5", ".renovaterc", ".renovaterc.json", ".renovaterc.json5"];
+async function collectGates(client, repo, { runs, byWf, defaultBranch, rootNames, jobsRaw, settle, settled }) {
+  const soft = async (p) => {
+    try {
+      return { ok: true, value: await settled(settle(p)) };
+    } catch (e) {
+      if (e instanceof RateLimitError) throw e;
+      return { ok: false, value: null };
+    }
+  };
+  const branch = defaultBranch ? encodeURIComponent(defaultBranch) : null;
+  const prRuns = [];
+  let unfinishedOnly = false;
+  for (const rs of byWf.values()) {
+    const done = rs.find((r) => PR_EVENTS.has(r.event) && r.status === "completed");
+    const any = done || rs.find((r) => PR_EVENTS.has(r.event));
+    if (!any) continue;
+    prRuns.push(any);
+    if (!done) unfinishedOnly = true;
+  }
+  const [rules, branchInfo, githubDir, ...prJobLists] = await Promise.all([
+    branch ? soft(client.get(`repos/${repo}/rules/branches/${branch}?per_page=100`)) : { ok: false, value: null },
+    branch ? soft(client.get(`repos/${repo}/branches/${branch}`)) : { ok: false, value: null },
+    soft(client.get(`repos/${repo}/contents/.github`)),
+    ...prRuns.map((r) => soft(jobsRaw(r)))
+  ]);
+  let required = null;
+  const rulesRead = rules.ok && Array.isArray(rules.value);
+  const protection = branchInfo.ok && branchInfo.value ? branchInfo.value.protection : void 0;
+  const classicRead = protection !== void 0 && protection !== null;
+  if (rulesRead || classicRead) {
+    const seen = /* @__PURE__ */ new Map();
+    const add = (context, integrationId) => {
+      if (typeof context !== "string" || !context) return;
+      const key = `${context}\0${integrationId ?? ""}`;
+      if (!seen.has(key)) seen.set(key, { context, integrationId: integrationId ?? null });
+    };
+    if (rulesRead) {
+      for (const rule of rules.value) {
+        if (rule && rule.type === "required_status_checks") {
+          for (const c of rule.parameters && rule.parameters.required_status_checks || []) add(c && c.context, c && c.integration_id);
+        }
+      }
+    }
+    if (classicRead && protection.enabled !== false) {
+      const rsc = protection.required_status_checks || {};
+      if (rsc.enforcement_level !== "off") {
+        for (const c of rsc.contexts || []) add(c, null);
+        for (const c of rsc.checks || []) add(c && c.context, c && c.app_id);
+      }
+    }
+    required = [...seen.values()];
+  }
+  const requiredComplete = rulesRead && classicRead;
+  const prChecks = /* @__PURE__ */ new Set();
+  let prJobsRead = 0;
+  let prJobsComplete = prRuns.length > 0 && !unfinishedOnly;
+  prJobLists.forEach((r) => {
+    if (r.ok && r.value && Array.isArray(r.value.jobs)) {
+      prJobsRead += 1;
+      if (r.value.complete === false) prJobsComplete = false;
+      for (const j of r.value.jobs) if (j && typeof j.name === "string") prChecks.add(j.name);
+    } else {
+      prJobsComplete = false;
+    }
+  });
+  const codeScanningRuns = runs.some((r) => String(r.path || "").startsWith("dynamic/github-code-scanning"));
+  const dependabotRuns = runs.some((r) => String(r.path || "").startsWith("dynamic/dependabot"));
+  const ghNames = githubDir.ok && Array.isArray(githubDir.value) ? new Set(githubDir.value.map((x) => x && x.name)) : null;
+  const dependabotFile = ghNames ? ghNames.has("dependabot.yml") || ghNames.has("dependabot.yaml") : null;
+  const renovateFile = ghNames && rootNames ? RENOVATE_FILES.some((f) => rootNames.has(f) || ghNames.has(f)) : null;
+  return {
+    branch: defaultBranch,
+    required,
+    required_complete: requiredComplete,
+    pr_runs_seen: prRuns.length,
+    pr_runs_read: prJobsRead,
+    pr_jobs_complete: prJobsComplete,
+    pr_checks: [...prChecks].sort(),
+    code_scanning_runs: codeScanningRuns,
+    dependency_updates: dependabotRuns || dependabotFile || renovateFile ? true : dependabotFile === null || renovateFile === null ? null : false
+  };
 }
 
 // src/util.mjs
@@ -8918,10 +9415,10 @@ function envTaint(env, outer) {
   }
   return out;
 }
-function jobsOf(doc) {
+function jobsOf2(doc) {
   return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object");
 }
-function stepsOf(job) {
+function stepsOf2(job) {
   return Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
 }
 function scanWorkflow(text) {
@@ -8929,10 +9426,10 @@ function scanWorkflow(text) {
   const workflowEnv = envTaint(doc.env, /* @__PURE__ */ new Set());
   const unpinned = [];
   const injections = [];
-  for (const [id, job] of jobsOf(doc)) {
+  for (const [id, job] of jobsOf2(doc)) {
     const reusable = parseUses(job.uses);
     if (reusable && !reusable.pinned) unpinned.push({ job: id, uses: String(job.uses), firstParty: reusable.firstParty });
-    stepsOf(job).forEach((st, i) => {
+    stepsOf2(job).forEach((st, i) => {
       const step = st.name ? String(st.name) : st.uses ? String(st.uses) : `step ${i + 1}`;
       const ref = parseUses(st.uses);
       if (ref && !ref.pinned) unpinned.push({ job: id, step, uses: String(st.uses), firstParty: ref.firstParty });
@@ -8953,7 +9450,7 @@ function scanWorkflow(text) {
     });
   }
   const isWriteAll = (p) => typeof p === "string" && p.trim().toLowerCase() === "write-all";
-  const jobs = jobsOf(doc);
+  const jobs = jobsOf2(doc);
   const writeAll = isWriteAll(doc.permissions) ? ["(workflow)"] : jobs.filter(([, j]) => isWriteAll(j.permissions)).map(([id]) => id);
   const unscoped = doc.permissions === void 0 ? jobs.filter(([, j]) => j.permissions === void 0).map(([id]) => id) : [];
   return { unpinned, injections, writeAll, unscoped, parsed: Object.keys(doc).length > 0 };
@@ -9360,6 +9857,12 @@ var THRESHOLDS = {
   depsPerJobWithCache: 45,
   checkoutPerJob: 12,
   toolchainPerJob: 15,
+  // On a self-hosted runner the host can carry the runtime, so a setup step that only restates a
+  // version is worth dropping at a far lower cost than on a hosted image.
+  toolchainPerJobSelfHosted: 2,
+  // A passing job's log over this is more than a job needs to say it passed; what fills it is
+  // inferred from the workflow file, never read from the bytes.
+  logBytesPerJob: 100 * 1024,
   duplicateCommitsWeek: 3,
   supersededWeek: 2,
   matrixJobs: 8,
@@ -9411,9 +9914,11 @@ function timeJobs(sampledRuns, commands) {
     sawCacheStep: false,
     billedPerRun: [],
     jobDurations: /* @__PURE__ */ new Map(),
-    jobHosted: /* @__PURE__ */ new Map()
+    jobHosted: /* @__PURE__ */ new Map(),
+    stepSeconds: /* @__PURE__ */ new Map(),
+    stepRunTotals: /* @__PURE__ */ new Map()
   };
-  for (const jobs of sampledRuns) {
+  for (const [r, jobs] of sampledRuns.entries()) {
     let runSeconds = 0;
     let billed = 0;
     for (const job of jobs) {
@@ -9437,6 +9942,12 @@ function timeJobs(sampledRuns, commands) {
         const seconds = secs(step.started_at, step.completed_at);
         t.secondsByCategory[kind] = (t.secondsByCategory[kind] || 0) + seconds;
         if (kind === "cache") t.sawCacheStep = true;
+        const label = `${jobName}\0${String(step.name).replace(/\s+/g, " ").trim()}`;
+        if (!t.stepSeconds.has(label)) t.stepSeconds.set(label, []);
+        t.stepSeconds.get(label).push(seconds);
+        if (!t.stepRunTotals.has(label)) t.stepRunTotals.set(label, []);
+        const totals = t.stepRunTotals.get(label);
+        totals[r] = (totals[r] || 0) + seconds;
         if (kind === "work") {
           const name = String(step.name).replace(/\s+/g, " ").slice(0, 60);
           if (!t.workStepSeconds.has(name)) t.workStepSeconds.set(name, []);
@@ -9497,6 +10008,25 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
   const facts = workflowFacts(doc);
   const timing = timeJobs(sampledRuns, stepCommands(doc));
   const shares = timeShares(timing);
+  const jobRuns = assignJobRuns(allJobTimeouts(doc).map((t) => ({ id: t.id, name: t.name, reusable: Boolean(t.reusable) })), [...timing.jobDurations.keys()]);
+  const priced = (jobId, name, { selfHostedOnly = false, low = false } = {}) => {
+    const label = String(name).replace(/\s+/g, " ").trim();
+    const apis = (jobRuns.get(jobId) || []).filter((api) => !selfHostedOnly || (timing.jobHosted.get(api) || 0) === 0);
+    const xs = apis.flatMap((api) => timing.stepSeconds.get(`${api}\0${label}`) || []);
+    if (!xs.length) return null;
+    if (low) return { each: round(Math.min(...xs), 1), perRun: null };
+    const byRun = [];
+    for (const api of apis) {
+      const totals = timing.stepRunTotals.get(`${api}\0${label}`) || [];
+      totals.forEach((v, r) => {
+        if (v !== void 0) byRun[r] = (byRun[r] || 0) + v;
+      });
+    }
+    const total = byRun.reduce((s, v) => s + (v || 0), 0);
+    return { each: round(median(xs), 1), perRun: round(total / Math.max(1, sampledRuns.length), 1) };
+  };
+  const logBytes = sampledRuns.flat().map((j) => j.log_bytes).filter((b) => Number.isFinite(b) && b >= 0);
+  const { sameTestsOf, artifactOf } = evidenceOf(sampledRuns[0] || [], jobRuns);
   const sampledCount = sampledRuns.length;
   const medianRunSeconds = median(timing.jobSecondsPerRun);
   const successfulWalls = workflowRuns.filter((r) => r.status === "completed" && r.conclusion === "success" && r.run_started_at).map((r) => secs(r.run_started_at, r.updated_at));
@@ -9587,8 +10117,70 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
     fork_reachable: forkReachableSelfHosted(doc, repo),
     job_timeouts: allJobTimeouts(doc),
     checkout: facts.checkout,
-    fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3)
+    fixed_share: round((shares.overhead || 0) + (shares.head || 0) + (shares.tail || 0) + (shares.checkout || 0), 3),
+    // A self-hosted setup step, priced from the sample by its job and step name: one execution,
+    // and what it costs a run (its matrix legs together); a name another step shares is not priced.
+    selfhosted_setups: selfHostedSetups(doc).map((s) => {
+      const p = s.unique ? priced(s.job, s.step, { selfHostedOnly: true }) : null;
+      return { ...s, seconds: p ? p.each : null, run_seconds: p ? p.perRun : null };
+    }),
+    // The same test step twice and the duplicate upload, as the file shows them (trim.mjs), each
+    // with the newest sampled run's own record: same_tests, what the two steps' logs list (by name
+    // or by count), and artifact, what the run's artifact holds. Null is no record, and no finding.
+    // Each step is priced from the sample; a step whose display name another step of the job
+    // shares is priced at the pooled list's minimum.
+    repeated_tests: repeatedTests(doc).map((r) => ({
+      ...r,
+      seconds: r.steps.map((s, i) => {
+        const p = priced(r.jobs[r.scope === "job" ? 0 : i], s, { low: r.shared[i] });
+        return p ? p.each : null;
+      }),
+      same_tests: sameTestsOf(r)
+    })),
+    duplicate_uploads: duplicateUploads(doc).map((u) => {
+      const p = priced(u.job, u.step);
+      return { ...u, seconds: p ? p.each : null, artifact: artifactOf(u) };
+    }),
+    // A passing job's log size, median over the sampled jobs whose size was read (null when none was).
+    log_bytes_p50: logBytes.length ? Math.round(median(logBytes)) : null,
+    log_jobs_read: logBytes.length,
+    starts_tests: startsTests(doc)
   };
+}
+function evidenceOf(newest, jobRuns) {
+  const oneJob = (fileJob) => {
+    const names = jobRuns.get(fileJob) || [];
+    if (names.length !== 1) return null;
+    const js = newest.filter((j) => String(j.name || "") === names[0]);
+    return js.length === 1 ? js[0] : null;
+  };
+  const sameTestsOf = (r) => {
+    let sigs;
+    if (r.scope === "job") {
+      const j = oneJob(r.jobs[0]);
+      sigs = j && typeof j.log_text === "string" ? signaturesOf(j.log_text, r.headers) : null;
+    } else {
+      sigs = r.jobs.map((id, i) => {
+        const j = oneJob(id);
+        const s = j && typeof j.log_text === "string" ? signaturesOf(j.log_text, [r.headers[i]]) : null;
+        return s ? s[0] : null;
+      });
+    }
+    if (!sigs || sigs.some((s) => !s)) return null;
+    const cmp = sigs.slice(1).map((s) => sameTests(sigs[0], s));
+    if (cmp.some((c) => !c)) return null;
+    return { same: cmp.every((c) => c.same), by: cmp.every((c) => c.by === "name") ? "name" : "count", count: cmp[0].count };
+  };
+  const artifactOf = (u) => {
+    const list3 = newest.map((j) => j.run_artifacts).find(Array.isArray);
+    if (!list3 || u.name === null) return null;
+    const hits = list3.filter((a2) => a2 && a2.name === u.name);
+    if (hits.length !== 1 || !Array.isArray(hits[0].entries)) return null;
+    const a = hits[0];
+    const base = u.path.split("/").pop();
+    return { bytes: a.bytes, entries: a.entries.length, one_file: a.entries.length === 1 && !a.entries[0].name.endsWith("/") && a.entries[0].name === base };
+  };
+  return { sameTestsOf, artifactOf };
 }
 var T = THRESHOLDS;
 function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch = null, isPublic = false }) {
@@ -9674,14 +10266,109 @@ function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch =
     }
   }
   const tc = perRun.toolchain || 0;
-  if (tc / jobs >= T.toolchainPerJob) {
+  const selfSetups = (w.selfhosted_setups || []).filter((s) => s.seconds !== null && s.seconds !== void 0 && s.seconds >= T.toolchainPerJobSelfHosted);
+  const selfSecs = selfSetups.reduce((s, x) => s + (x.run_seconds ?? x.seconds), 0);
+  if (selfSetups.length) {
+    const names = selfSetups.slice(0, 4).map((s) => `${s.action} in job ${s.job}, ${fmtS(s.seconds)}${s.run_seconds !== null && s.run_seconds !== s.seconds ? ` a leg, ${fmtS(s.run_seconds)} a run` : ""}`);
+    add(
+      selfSecs * w.runs_week / 60,
+      "toolchain setup",
+      `toolchain setup on self-hosted runners takes ${fmtS(selfSecs)} a run (${names.join("; ")}${selfSetups.length > 4 ? "; and more" : ""}), where the host can carry the runtime, so the step only restates its version`,
+      "use the runtime the host has, pin its version in the host image, and drop the setup step",
+      { confidence: "inferred", tradeoff: "the job follows the host image's update schedule, and a job that needs another version keeps its step", brief: `${fmtS(selfSecs)} a run on self-hosted runners` }
+    );
+  }
+  const restTc = Math.max(0, tc - selfSecs);
+  if (restTc / jobs >= T.toolchainPerJob) {
     const note = w.setup_cache ? " (this includes restoring the dependency cache, which the setup step does)" : "";
     add(
-      0.5 * tc * w.runs_week / 60,
+      0.5 * restTc * w.runs_week / 60,
       "toolchain setup",
-      `toolchain setup takes ${fmtS(tc / jobs)} per job${note}`,
+      `toolchain setup takes ${fmtS(restTc / jobs)} per job${note}`,
       "use runtime versions the runner image already has, or an image with the toolchain baked in",
-      { confidence: "inferred", tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(tc / jobs)}${w.setup_cache ? " (with its dependency cache restore)" : ""}` }
+      { confidence: "inferred", tradeoff: "pinning to the image's version ties the job to the image's update schedule", brief: `${fmtS(restTc / jobs)}${w.setup_cache ? " (with its dependency cache restore)" : ""}` }
+    );
+  }
+  if (w.log_bytes_p50 !== null && w.log_bytes_p50 !== void 0 && w.log_bytes_p50 >= T.logBytesPerJob && (w.starts_tests || w.hosted_share < 0.5)) {
+    const kb = Math.round(w.log_bytes_p50 / 1024);
+    const mbWeek = round(w.log_bytes_p50 * jobs * w.runs_week / 1048576, 1);
+    F.push({
+      saving: 0,
+      unit: "log",
+      confidence: "measured",
+      what: "test output floods the log",
+      workflow: w.workflow,
+      evidence: `a passing job's log is ${kb} KB (median of ${w.log_jobs_read} sampled job${w.log_jobs_read === 1 ? "" : "s"}), about ${mbWeek} MB a week over ${jobs} job${jobs === 1 ? "" : "s"} a run and ${Math.round(w.runs_week)} runs${w.starts_tests ? "; the workflow starts a test runner, whose line for each passing test is the likely source (the bytes themselves were not read)" : ""}; the runner streams every line to GitHub as the job runs and uploads each step's log before it reports done${w.hosted_share < 0.5 ? ", from a self-hosted runner" : ""}` + thin,
+      fix: "a quiet reporter: node --test --test-reporter=dot (one character a test; Node 22 then lists each failed test with its assertion and stack, and prints no count of passing tests), pytest -q, jest --silent, cargo test -q, go test without -v",
+      tradeoff: "a passing run shows no list and no count of what ran; the failures stay in full, and a reporter that drops them is the wrong one",
+      example: "run: node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.mjs",
+      parts: null,
+      brief: `${kb} KB a job`,
+      size: w.log_bytes_p50,
+      thin: w.thin_sample ? w.sampled_runs : null,
+      log_mb_week: mbWeek
+    });
+  }
+  const repeats = (w.repeated_tests || []).filter((r) => r.same_tests && r.same_tests.same);
+  if (repeats.length) {
+    const secondsOf = (r) => {
+      const xs = r.seconds.filter((s) => s !== null);
+      return xs.length > 1 ? Math.min(...xs) * (xs.length - 1) : 0;
+    };
+    const saving = repeats.reduce((s, r) => s + secondsOf(r), 0) * w.runs_week / 60;
+    const describe = (r) => {
+      const steps = r.steps.map((s) => `"${s}"`).join(" and ");
+      const priced = r.seconds.every((s) => s !== null) ? ` (${r.seconds.map(fmtS).join(" and ")} a run)` : " (not every step was timed in the sample)";
+      const proof = r.same_tests.by === "name" ? `the newest sampled run's logs list the same ${r.same_tests.count} tests by name in both` : `the newest sampled run's logs report the same count, ${r.same_tests.count} tests, in both (the runner lists no names)`;
+      if (r.scope === "job") return `job ${r.jobs[0]} runs the same test step twice, \`${r.command}\` in steps ${steps}${priced}; ${proof}`;
+      return `jobs ${r.jobs.join(" and ")} run the same test step, \`${r.command}\`, on the same runner, environment and directory, after the same steps${priced}; ${proof}`;
+    };
+    add(
+      saving,
+      "tests run twice",
+      repeats.slice(0, 3).map(describe).join("; ") + (repeats.length > 3 ? `; and ${repeats.length - 3} more` : ""),
+      "run the suite once; where the second run is wanted on one event (the push to the default branch, a release), keep it and gate it on that event",
+      {
+        confidence: "measured",
+        tradeoff: "a second run kept to catch a flaky test is the point of itself: keep it, and say so in the step name; gated, the second run happens after the merge instead of on the pull request",
+        // The gate names the event and the default branch both: `push` alone would keep the second
+        // run on every branch's pushes. The step's script is repeated as written (quoting and all),
+        // never rebuilt from the command's words, and always as a block scalar: a plain scalar would
+        // read `node --test "test/a: b.mjs"` as a mapping.
+        example: `- name: Tests, second run
+  if: github.event_name == 'push' && github.ref == 'refs/heads/${defaultBranch || "<default branch>"}'   # once, after the merge; the pull request ran them above
+  run: |
+    ${repeats[0].script.split("\n").join("\n    ")}`
+      }
+    );
+  }
+  const dupes = (w.duplicate_uploads || []).filter((u) => u.artifact && u.artifact.one_file);
+  if (dupes.length) {
+    const saving = dupes.reduce((s, u) => s + (u.seconds || 0), 0) * w.runs_week / 60;
+    const kb = (b) => `${Math.max(1, Math.round(b / 1024))} KB`;
+    const describe = (u) => `job ${u.job} uploads ${u.path} as the artifact "${u.name}" in "${u.step}"${u.seconds !== null ? ` (${fmtS(u.seconds)} a run)` : ""} and sends the same file to ${u.alsoTo.join(" and ")}${u.after ? ", in a later step" : ""}; the newest sampled run's artifact holds that one file (${kb(u.artifact.bytes)} zipped)`;
+    const later = dupes.some((u) => u.after);
+    add(
+      saving,
+      "an artifact that duplicates another upload",
+      dupes.slice(0, 3).map(describe).join("; ") + (dupes.length > 3 ? `; and ${dupes.length - 3} more` : ""),
+      later ? "move the artifact step after the upload it duplicates and give it `if: failure()`, so the file is kept only on a run where that upload failed; where the upload comes first, drop the artifact step" : "drop the artifact step; the file is already where it is read",
+      {
+        confidence: "measured",
+        tradeoff: "none while the other destination is browsable (code scanning shows the SARIF, the release its assets) and nothing downloads the artifact: no download-artifact step in this file does, but another workflow or a script fetching it by run is not visible here, so check for one before the step goes; keep the artifact for a destination that is not browsable",
+        // The step's name and the path are written as double-quoted YAML scalars (JSON strings
+        // are valid ones): a `: ` inside either would otherwise read as a mapping.
+        example: later ? `# after the step that sends ${dupes[0].path} to ${dupes[0].alsoTo[0]}
+- name: ${JSON.stringify(dupes[0].step)}
+  if: failure()   # only when that upload failed
+  uses: actions/upload-artifact@...
+  with:
+    path: ${JSON.stringify(dupes[0].path)}` : `# remove
+- name: ${JSON.stringify(dupes[0].step)}
+  uses: actions/upload-artifact@...
+  with:
+    path: ${JSON.stringify(dupes[0].path)}`
+      }
     );
   }
   if (w.dup_commits_week >= T.duplicateCommitsWeek) {
@@ -9987,7 +10674,7 @@ function analyseParsed(repo, data) {
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
   const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map(), { repo }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
-  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.saving >= T.minSavingWeek).map((f) => ({
+  const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.unit === "log" || f.what === "an artifact that duplicates another upload" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",
     workflow: f.workflow,
@@ -9996,7 +10683,9 @@ function analyseParsed(repo, data) {
     fix: f.fix,
     tradeoff: f.tradeoff || "",
     example: f.example || "",
-    confidence: f.confidence
+    confidence: f.confidence,
+    // A log finding's figure is megabytes a week, not minutes; it rides beside the saving.
+    ...f.unit === "log" ? { log_mb_week: f.log_mb_week } : {}
   }));
   return {
     repo,
@@ -10078,6 +10767,7 @@ var GUARDS = {
 var guardsAgainst = (f) => GUARDS[f.what] || null;
 function savingText(f) {
   if (isRisk(f)) return "a security and stability risk, not minutes";
+  if (f.unit === "log") return num(f.log_mb_week) ? `about ${f.log_mb_week} MB of log a week (measured), not minutes` : "log volume, not minutes";
   if (isGuard(f)) return guardsAgainst(f) ? `a guard against ${guardsAgainst(f)}, not minutes` : "a guard, not minutes";
   if (isWait(f)) return "saves developer wait, not job minutes";
   const unit = f.unit === "billed" ? "billed" : "job";

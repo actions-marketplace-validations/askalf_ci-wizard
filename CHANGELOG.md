@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Setups a self-hosted host already carries, and logs nobody reads. Found by hand on a self-hosted
+repository on 2026-11-08 (an 80 s job with a 471 KB log, cut to 17 s and 41 KB), now rules:
+
+- **toolchain setup** on self-hosted runners fires at 2 s a step when the file has a runtime-only
+  setup action there (no cache, registry or signing input; `setup-go` only with `cache: false`):
+  the host can carry the runtime, and the whole step is the saving, priced from its own job's
+  sampled runs.
+- **test output floods the log:** a passing job's log of 100 KB or more, in megabytes a week.
+  Read from one new endpoint, the job-logs redirect, followed by a HEAD for the size; the log is
+  not downloaded for this rule. `collect` takes `logs: false` to skip it.
+
+Two rules that would remove a step, built from every case the review of the first attempt raised
+(ci-wizard#34). A workflow file cannot establish that a second copy is the first, so the file
+picks the candidates and the newest sampled run's own record confirms them; without it the rules
+are silent:
+
+- **tests run twice:** the same one-command test step twice, in one job or in two jobs alike in
+  every way the file shows (command, condition, directory, environment, shell, runner, container,
+  services, every step before), and the two steps' sections of the run's job log list the same
+  tests, by name where the runner prints them (TAP, `go test -v`, `pytest -v`, a jest or vitest
+  listing), else by count. The shorter run is the saving. The logs of the jobs a candidate names
+  are now downloaded (from the redirect's address, no token, up to 8 MB).
+- **an artifact that duplicates another upload:** an `upload-artifact` step whose one literal
+  file another step of the job sends to code scanning or the release, and the run's artifact of
+  that name holds exactly that one file. Two new endpoints, the run's artifact listing and the
+  artifact's zip redirect, read only where the file raises a candidate; the zip is read for the
+  names in its directory and never opened. `collect` takes `artifacts: false` to skip it.
+
 ## 0.3.0
 
 Merge gates: what stands between a pull request and the default branch.
