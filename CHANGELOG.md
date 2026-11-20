@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 Setups a self-hosted host already carries, and logs nobody reads. Found by hand on a self-hosted
 repository on 2026-11-08 (an 80 s job with a 471 KB log, cut to 17 s and 41 KB), now rules:
@@ -29,6 +29,28 @@ are silent:
   that name holds exactly that one file. Two new endpoints, the run's artifact listing and the
   artifact's zip redirect, read only where the file raises a candidate; the zip is read for the
   names in its directory and never opened. `collect` takes `artifacts: false` to skip it.
+
+Fixed:
+
+- **the same commit runs twice** prices a duplicate at the cheaper of its two runs, measured on
+  the commits that ran on both events, instead of at the workflow's mean run. A pull request run
+  that skips the tests for a branch of the repository (a job-level `if:`) costs a fraction of the
+  mean, and a pull request from a fork, which has no push run, no longer prices it. On a large
+  public repository audited on 2026-11-20 the figure fell from about 466 job-minutes a week to the
+  103 its one duplicated job really costs.
+- **job token wider than the job** reads the reusable workflow a job calls: a call whose file
+  gives every job narrowed permissions (the job's own block, or else the file's default, never
+  `write-all`) is no longer called unscoped, and the evidence names
+  the jobs rather than the whole file. Before, a local call to a file that sets `contents: read`
+  was reported as handing out the default token.
+- **no code scanning** reads the reusable workflows a job calls, in this repository or another
+  (at the called ref, up to 12 files): CodeQL run through a shared workflow of another repository
+  now counts, and a called file that could not be read, or a call that cannot be resolved, leaves
+  the finding out instead of claiming there is no scanner.
+- **required checks no pull request reports** reads the newest successful pull request run. The
+  newest completed one could be cancelled, waiting for a maintainer's approval or failed, and stop
+  before a matrix whose names the required checks match: such a run is no longer taken as the
+  checks pull requests get.
 
 ## 0.3.0
 

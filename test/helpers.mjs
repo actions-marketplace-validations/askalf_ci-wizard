@@ -16,7 +16,7 @@ export function run({ name = 'CI', event = 'push', sha, branch = 'main', conclus
 }
 
 /** A job: steps as [name, seconds]; steps run back to back after `head` seconds, then `tail` seconds before the job completes. */
-export function job({ steps = [['Set up job', 1], ['Run tests', 30], ['Complete job', 0]], wait = 2, head = 1, tail = 2, at = 0, selfHosted = false } = {}) {
+export function job({ steps = [['Set up job', 1], ['Run tests', 30], ['Complete job', 0]], wait = 2, head = 1, tail = 2, at = 0, selfHosted = false, runId = undefined } = {}) {
   const created = at;
   const started = at + wait;
   let cur = started + head;
@@ -30,6 +30,7 @@ export function job({ steps = [['Set up job', 1], ['Run tests', 30], ['Complete 
     runner_name: selfHosted ? 'self-hosted-1' : 'GitHub Actions 12',
     labels: selfHosted ? ['self-hosted', 'Linux', 'X64'] : ['ubuntu-latest'],
     steps: st,
+    ...(runId !== undefined ? { run_id: runId } : {}),
   };
 }
 
@@ -41,6 +42,7 @@ export function data({ workflows, coveredDays = 7, lockfiles = [] }) {
   const runs = [];
   const byWf = new Map();
   const samples = new Map();
+  const sampleRunIds = new Map();
   const files = new Map();
   for (const w of workflows) {
     const path = w.path || '.github/workflows/ci.yml';
@@ -48,9 +50,10 @@ export function data({ workflows, coveredDays = 7, lockfiles = [] }) {
     runs.push(...rs);
     byWf.set(w.name, rs);
     samples.set(w.name, w.jobsPerRun || [[job()]]);
+    if (w.runIds) sampleRunIds.set(w.name, w.runIds);
     if (w.file !== undefined) files.set(path, w.file);
   }
-  return { runs, byWf, samples, coveredDays, since: t(-7 * 86400), files, lockfiles };
+  return { runs, byWf, samples, sampleRunIds, coveredDays, since: t(-7 * 86400), files, lockfiles };
 }
 
 /** n runs of one workflow spread over the window, all with the given fields. */

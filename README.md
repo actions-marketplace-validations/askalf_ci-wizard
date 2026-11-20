@@ -71,11 +71,11 @@ Outputs: `report-path`, `findings`.
 ### From the command line
 
 ```sh
-npx ci-wizard@0.3.0 owner/repo
-npx ci-wizard@0.3.0 owner/repo --save before.json      # keep a baseline
-npx ci-wizard@0.3.0 owner/repo --html audit.html       # a self-contained page
-npx ci-wizard@0.3.0 owner/repo --only CI --json        # one workflow, as JSON
-npx ci-wizard@0.3.0 compare before.json after.json     # did the fix work?
+npx ci-wizard@0.4.0 owner/repo
+npx ci-wizard@0.4.0 owner/repo --save before.json      # keep a baseline
+npx ci-wizard@0.4.0 owner/repo --html audit.html       # a self-contained page
+npx ci-wizard@0.4.0 owner/repo --only CI --json        # one workflow, as JSON
+npx ci-wizard@0.4.0 compare before.json after.json     # did the fix work?
 ```
 
 You can name the repository as `owner/repo`, a GitHub URL or an SSH remote. Leave it out and the
@@ -186,6 +186,9 @@ one that has a hostile contributor.
     names in its directory and never opened;
   - `/contents/.github/workflows`, the workflow files (up to 30), the root listing (to see which
     lockfile is committed) and the `.github` listing (for Dependabot's configuration);
+  - `/repos/{owner}/{repo}/contents/.github/workflows/{file}?ref={ref}` for a reusable workflow a
+    job calls in another repository (up to 12 files, four calls deep), read for whether it runs a
+    code scanner and how it scopes the job token;
   - `/repos/{repo}` (default branch and visibility);
   - `/rules/branches/{default branch}` and `/branches/{default branch}`, for the checks a merge
     must wait for. These need only the read access every token has.
@@ -308,7 +311,8 @@ The token lasts an hour and is revoked when the job ends.
 - **The scans are a first pass, not an audit.** They don't check:
   - `pull_request_target` or `workflow_run` jobs that run a fork's code or artifacts;
   - composite actions under `.github/actions`;
-  - reusable workflows in other repositories.
+  - reusable workflows in other repositories, beyond whether they run a code scanner and how
+    they scope the job token.
 
   Fork exposure and runner reuse are judged from the sampled workflows.
 - **Options, not orders.** A fix can disagree with a repository's own history. For example, a
