@@ -2,8 +2,10 @@ import { NotFoundError, RateLimitError } from './github.mjs';
 import { allJobTimeouts, assignJobRuns, parseWorkflow } from './workflow.mjs';
 import { duplicateUploads, repeatedTests } from './trim.mjs';
 import { zipEntries } from './zip.mjs';
+import { MAX_CALL_DEPTH, callsOf, isRemoteKey, remoteParts } from './reusable.mjs';
 
-// Reads what an audit needs from GitHub, read-only: up to 500 workflow runs from the window, the
+// Reads what an audit needs from GitHub, read-only: up to maxPages pages of 100 workflow runs from the
+// window (5 by default; GitHub serves 10 at most for a list filtered by date), the
 // jobs (with their steps) of the newest successful runs of the busiest workflows, those
 // workflows' files, and the repository's root listing (to see which lockfiles it commits). Where
 // a sampled workflow's file raises a candidate for a rule that would remove a step (trim.mjs), the
@@ -12,6 +14,16 @@ import { zipEntries } from './zip.mjs';
 // Each segment of a file path percent-encoded: a name with ? or # would otherwise change which
 // file, or which ref, the contents API reads.
 const encodePath = (path) => String(path).split('/').map(encodeURIComponent).join('/');
+// At most this many reusable workflows of other repositories are read for one audit.
+const MAX_REUSABLE_READS = 12;
+// For the duplicate-commit rule: successful runs of each kind (push, pull request) of a commit that
+// ran on both, timed per sampled workflow, counting those the newest successes already hold.
+const DUP_RUNS_PER_KIND = 2;
+// For the reruns rule: re-attempted runs per sampled workflow whose jobs of every attempt are read.
+const RERUNS_PER_WORKFLOW = 3;
+// A run's kind as the duplicate-commit rule reads it (analyse.mjs): a merge-queue run is neither.
+const PULL_REQUEST_EVENTS = new Set(['pull_request', 'pull_request_target']);
+const kindOf = (r) => (r.event === 'push' ? 'push' : PULL_REQUEST_EVENTS.has(r.event) ? 'pull_request' : null);
 
 const LOCKFILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'bun.lock', 'poetry.lock', 'uv.lock', 'Pipfile.lock', 'go.sum', 'Cargo.lock', 'Gemfile.lock'];
 
@@ -55,7 +67,12 @@ export function groupRuns(runs, names = new Map()) {
  * @param {string} repo owner/name
  * @param {{ days?: number, perWorkflow?: number, perOutcome?: number, workflows?: number, only?: string[], now?: Date, maxPages?: number, onProgress?: (msg: string) => void }} [o]
  */
-export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = new Date(), maxPages = 5, maxScanFiles = 30, logs = true, artifacts = true, maxLogBytes = 8 * 1048576, maxArtifactBytes = 8 * 1048576, onProgress = () => {} } = {}) {
+export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = new Date(), maxPages: askedPages = 5, maxScanFiles = 30, logs = true, artifacts = true, maxLogBytes = 8 * 1048576, maxArtifactBytes = 8 * 1048576, onProgress = () => {} } = {}) {
+  // GitHub serves the first 1000 results of a runs list filtered by date, 10 pages of 100: a page past
+  // them holds none of the window's runs, so no more are asked for. A limit that is not a finite
+  // number reads one page, so the window's coverage is still computed from what was read.
+  const asked = Math.floor(Number(askedPages));
+  const maxPages = Number.isFinite(asked) ? Math.max(1, Math.min(10, asked)) : 1;
   const since = new Date(now.getTime() - days * 86400e3).toISOString().replace(/\.\d{3}Z$/, 'Z');
   const runs = [];
   let truncated = false;
@@ -149,6 +166,9 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   const top = wanted.length ? ranked.filter(([label, rs]) => wanted.some((n) => matches(label, rs, n))) : ranked.slice(0, workflows);
   const onlyMissing = wanted.length ? only.filter((n) => String(n).trim() && !ranked.some(([label, rs]) => matches(label, rs, n))) : [];
   const samples = new Map();
+  // The run id of each sampled run, beside its jobs in the same order: a run whose jobs were all
+  // skipped is an empty list, and only this says which run (and so which event) it was.
+  const sampleRunIds = new Map();
   // Runs that did not succeed cost job time too, and not the same as a success: a failure often
   // stops early, a timeout runs to its limit. A few of each are timed apart, so the weekly cost
   // counts every outcome at its own measured cost (OUTCOMES in analyse.mjs).
@@ -157,23 +177,35 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   // A run with more than 100 jobs (a large matrix) is read page by page, up to 10 pages; `complete`
   // says whether every job was read, so an absent name is only a conclusion when it was.
   const rawJobs = new Map();
-  const jobsRaw = (r) => {
-    if (!rawJobs.has(r.id)) {
-      rawJobs.set(r.id, (async () => {
-        const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100&page=${page}`;
-        const first = await client.get(url(1));
-        if (!first) return null;
-        const jobs = [...(first.jobs || [])];
-        const total = Number.isFinite(first.total_count) ? first.total_count : jobs.length;
-        const pages = Math.min(10, Math.ceil(total / 100));
-        if (pages > 1) {
-          const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
-          for (const d of rest) if (d) jobs.push(...(d.jobs || []));
-        }
-        return { ...first, jobs, complete: jobs.length >= total };
-      })());
+  const pagedJobs = async (r, query = '') => {
+    const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?${query}per_page=100&page=${page}`;
+    const first = await client.get(url(1));
+    if (!first) return null;
+    const jobs = [...(first.jobs || [])];
+    const total = Number.isFinite(first.total_count) ? first.total_count : jobs.length;
+    const pages = Math.min(10, Math.ceil(total / 100));
+    if (pages > 1) {
+      const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
+      for (const d of rest) if (d) jobs.push(...(d.jobs || []));
     }
+    return { ...first, jobs, complete: jobs.length >= total };
+  };
+  const jobsRaw = (r) => {
+    if (!rawJobs.has(r.id)) rawJobs.set(r.id, pagedJobs(r));
     return rawJobs.get(r.id);
+  };
+  // A re-attempted run's jobs of every attempt (filter=all): re-running only the failed jobs lists
+  // every job again under the new attempt, so what the attempts re-ran is read from all of them
+  // (rerunSeconds in analyse.mjs). Null when the list cannot be read whole; the reruns rule prices
+  // the reruns of a workflow none of whose reruns was read at a whole run.
+  const attemptsOf = async (r) => {
+    try {
+      const j = await pagedJobs(r, 'filter=all&');
+      return j && j.complete ? j.jobs : null;
+    } catch (e) {
+      if (e instanceof RateLimitError) throw e;
+      return null;
+    }
   };
   const jobsOf = async (r) => {
     const j = await jobsRaw(r);
@@ -188,8 +220,28 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
     onProgress(`timing ${wf} (${n + 1}/${top.length})`);
     const ok = rs.filter((r) => r.status === 'completed' && r.conclusion === 'success').slice(0, perWorkflow);
     const outcomes = ['failure', 'cancelled', 'timed_out'].map((outcome) => [outcome, rs.filter((r) => r.status === 'completed' && r.conclusion === outcome).slice(0, perOutcome)]);
-    const [okJobs, ...outcomeJobs] = await Promise.all([
+    // The newest successes may hold no run of a commit that ran on both a push and a pull request,
+    // or none of one kind; the duplicate-commit rule prices a duplicate at the cheaper of the two
+    // runs, so successful runs of such commits are timed too, up to DUP_RUNS_PER_KIND of each kind.
+    const kindsOfCommit = new Map();
+    for (const r of rs) {
+      const kind = kindOf(r);
+      if (!kind) continue;
+      if (!kindsOfCommit.has(r.head_sha)) kindsOfCommit.set(r.head_sha, new Set());
+      kindsOfCommit.get(r.head_sha).add(kind);
+    }
+    const ofDupCommit = (r) => kindOf(r) && (kindsOfCommit.get(r.head_sha) || new Set()).size === 2;
+    const okIds = new Set(ok.map((r) => r.id));
+    const dupPicked = ['push', 'pull_request'].flatMap((kind) => {
+      const held = ok.filter((r) => ofDupCommit(r) && kindOf(r) === kind).length;
+      return rs.filter((r) => !okIds.has(r.id) && r.status === 'completed' && r.conclusion === 'success' && kindOf(r) === kind && ofDupCommit(r))
+        .slice(0, Math.max(0, DUP_RUNS_PER_KIND - held));
+    });
+    const rerunPicked = rs.filter((r) => r.status === 'completed' && (r.run_attempt || 1) > 1).slice(0, RERUNS_PER_WORKFLOW);
+    const [okJobs, dupJobs, rerunJobs, ...outcomeJobs] = await Promise.all([
       Promise.all(ok.map(jobsOf)),
+      Promise.all(dupPicked.map(jobsOf)),
+      Promise.all(rerunPicked.map(attemptsOf)),
       ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf))),
     ]);
     const byOutcome = {};
@@ -197,11 +249,20 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
       const got = outcomeJobs[i].filter(Boolean);
       if (got.length) byOutcome[outcome] = got;
     });
-    return [wf, okJobs.filter(Boolean), byOutcome];
+    const okRuns = ok.map((r, i) => [r.id, okJobs[i]]).filter(([, jobs]) => jobs);
+    const dupRuns = dupPicked.map((r, i) => ({ id: r.id, jobs: dupJobs[i] })).filter((d) => d.jobs);
+    return [wf, okRuns.map(([, jobs]) => jobs), byOutcome, okRuns.map(([id]) => id), dupRuns, rerunJobs.filter(Boolean)];
   }));
-  for (const [wf, jobsPerRun, byOutcome] of timed) {
+  // Per sampled workflow: the extra duplicate-commit runs ({ id, jobs }), and the jobs of every
+  // attempt of each re-attempted run read.
+  const dupSamples = new Map();
+  const rerunSamples = new Map();
+  for (const [wf, jobsPerRun, byOutcome, runIds, dupRuns, rerunJobs] of timed) {
     samples.set(wf, jobsPerRun);
+    sampleRunIds.set(wf, runIds);
     outcomeSamples.set(wf, byOutcome);
+    dupSamples.set(wf, dupRuns);
+    rerunSamples.set(wf, rerunJobs);
   }
   // How much log a passing job writes: the size of each job's log in the newest sampled successful
   // run of each workflow (one API call per job for the redirect; the size comes from the file's
@@ -313,6 +374,31 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
     else unreadable.push(path);
   });
   const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
+  // The reusable workflows those files call in other repositories, each read once at the called ref,
+  // and the ones those call in turn, up to GitHub's own nesting limit and twelve files: what such a
+  // call scans and how it scopes the token are in the called file. One that cannot be read (a private
+  // repository, a deleted ref) is kept as null, so the rules that read it say they could not.
+  const reusableFiles = new Map();
+  let calls = [...scanFiles.values()].flatMap((text) => callsOf(text)).map((c) => c.key).filter(isRemoteKey);
+  for (let depth = 0; depth < MAX_CALL_DEPTH && calls.length; depth++) {
+    const batch = [...new Set(calls)].filter((k) => !reusableFiles.has(k)).slice(0, Math.max(0, MAX_REUSABLE_READS - reusableFiles.size));
+    if (!batch.length) break;
+    const texts = await Promise.all(batch.map(async (k) => {
+      const p = remoteParts(k);
+      try {
+        return await client.getRaw(`repos/${p.owner}/${p.repo}/contents/${encodePath(p.path)}?ref=${encodeURIComponent(p.ref)}`);
+      } catch (e) {
+        if (e instanceof RateLimitError) throw e;
+        return null;
+      }
+    }));
+    calls = [];
+    batch.forEach((k, i) => {
+      const text = typeof texts[i] === 'string' ? texts[i] : null;
+      reusableFiles.set(k, text);
+      if (text) calls.push(...callsOf(text, remoteParts(k)).map((c) => c.key).filter(isRemoteKey));
+    });
+  }
   // The default branch, for advice that names it (a push trigger limited to it). Unknown when the
   // token cannot read the repository's metadata; the advice then says to fill it in.
   const defaultBranch = meta && typeof meta.default_branch === 'string' ? meta.default_branch : null;
@@ -324,7 +410,7 @@ export async function collect(client, repo, { days = 7, perWorkflow = 5, perOutc
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
   onProgress('reading merge gates');
   const gates = await collectGates(client, repo, { runs, byWf, defaultBranch, rootNames: Array.isArray(rootListing) ? names : null, jobsRaw, settle, settled });
-  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
+  return { runs, byWf, samples, sampleRunIds, outcomeSamples, dupSamples, rerunSamples, scanFiles, reusableFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
 }
 
 const PR_EVENTS = new Set(['pull_request', 'pull_request_target', 'merge_group']);
@@ -334,7 +420,7 @@ const RENOVATE_FILES = ['renovate.json', 'renovate.json5', '.renovaterc', '.reno
  * What guards a merge into the default branch, from what a read-only token can see: the required
  * status checks of the branch's rulesets (GET rules/branches) and of classic branch protection (the
  * branch's protection summary), the checks pull requests actually got (the jobs of each workflow's
- * newest pull request run in the window: a job's name is the check Actions reports), whether code
+ * newest successful pull request run in the window: a job's name is the check Actions reports), whether code
  * scanning runs, and whether dependency updates are configured. Anything that could not be read is
  * null (unknown), never "none".
  */
@@ -348,17 +434,20 @@ async function collectGates(client, repo, { runs, byWf, defaultBranch, rootNames
     }
   };
   const branch = defaultBranch ? encodeURIComponent(defaultBranch) : null;
-  // The newest completed pull request run of each workflow that ran on one in the window: a run
-  // still going may not have created all its jobs yet (a matrix computed by a setup job). Where only
-  // an unfinished run is there, its names still count as seen, but no absence is judged from it.
+  // The newest successful pull request run of each workflow that ran on one in the window: only a
+  // run that succeeded created every job it would. A run still going may not have created them all
+  // yet (a matrix computed by a setup job); a cancelled run, one waiting for a maintainer's approval
+  // or one that failed stops before its later jobs, and a matrix behind `needs:` is never expanded
+  // into the names a required check matches. Where no successful run is there, the newest other
+  // run's names still count as seen, but no absence is judged from them.
   const prRuns = [];
   let unfinishedOnly = false;
   for (const rs of byWf.values()) {
-    const done = rs.find((r) => PR_EVENTS.has(r.event) && r.status === 'completed');
-    const any = done || rs.find((r) => PR_EVENTS.has(r.event));
+    const ok = rs.find((r) => PR_EVENTS.has(r.event) && r.status === 'completed' && r.conclusion === 'success');
+    const any = ok || rs.find((r) => PR_EVENTS.has(r.event) && r.status === 'completed') || rs.find((r) => PR_EVENTS.has(r.event));
     if (!any) continue;
     prRuns.push(any);
-    if (!done) unfinishedOnly = true;
+    if (!ok) unfinishedOnly = true;
   }
   const [rules, branchInfo, githubDir, ...prJobLists] = await Promise.all([
     branch ? soft(client.get(`repos/${repo}/rules/branches/${branch}?per_page=100`)) : { ok: false, value: null },

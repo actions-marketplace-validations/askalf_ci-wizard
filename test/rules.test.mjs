@@ -2,8 +2,8 @@
 // mutant of the rule (a dropped condition, a moved threshold) fails here.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { analyse, THRESHOLDS } from '../src/analyse.mjs';
-import { data, find, job, run, runs } from './helpers.mjs';
+import { analyse, rerunSeconds, THRESHOLDS } from '../src/analyse.mjs';
+import { data, find, job, run, runs, t } from './helpers.mjs';
 
 const NODE_STEPS = (install) => [['Set up job', 1], ['Run actions/checkout@v4', 2], ['Run actions/setup-node@v4', 3], ['Install', install], ['Run tests', 40], ['Complete job', 0]];
 const file = (setupWith = '', extra = '') => `name: CI
@@ -120,6 +120,79 @@ test('the same commit runs twice: with push on the default branch only it is mea
   assert.doesNotMatch(f.evidence, /keys pull requests by number/);
 });
 
+test('the same commit runs twice: the cheaper of the two runs is the saving, so a pull request run that skips the tests is priced as the short run it is', () => {
+  const rs = dupRuns(10);
+  const push = rs.find((r) => r.event === 'push');
+  const pr = rs.find((r) => r.event === 'pull_request');
+  // The push run tests for 600 s; the pull request run of the same commit skips the tests and runs one 60 s job.
+  const jobsPerRun = [
+    [job({ runId: push.id, steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 })],
+    [job({ runId: pr.id, steps: [['Publish preview', 60]], wait: 0, head: 0, tail: 0 })],
+  ];
+  const a = audit([{ name: 'CI', runs: rs, jobsPerRun, file: dupFile("main, 'feat/*'", '${{ github.workflow }}-${{ github.event.number || github.sha }}') }]);
+  const [f] = find(a, 'the same commit runs twice');
+  assert.ok(f, JSON.stringify(a.findings));
+  assert.equal(f.saving_min_week, 10); // 10 duplicate commits x the 1-minute pull request run, not the 5.5-minute mean
+  assert.match(f.evidence, /the cheaper of the two is the pull request run, 60 s of job time \(the mean of 1 timed pull request run\)/);
+  // The other way round: a push run cheaper than its pull request run prices the duplicate.
+  const flipped = [
+    [job({ runId: push.id, steps: [['Lint', 120]], wait: 0, head: 0, tail: 0 })],
+    [job({ runId: pr.id, steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 })],
+  ];
+  const [g] = find(audit([{ name: 'CI', runs: rs, jobsPerRun: flipped, file: dupFile("main, 'feat/*'", 'x') }]), 'the same commit runs twice');
+  assert.equal(g.saving_min_week, 20);
+  assert.match(g.evidence, /the cheaper of the two is the push run/);
+  // A pull request from a fork has no push run of its commit: its full test run does not price the duplicate.
+  const fork = run({ event: 'pull_request', sha: 'fork1', branch: 'patch-1' });
+  const withFork = [...jobsPerRun, [job({ runId: fork.id, steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 })]];
+  const [h] = find(audit([{ name: 'CI', runs: [...rs, fork], jobsPerRun: withFork, file: dupFile("main, 'feat/*'", 'x') }]), 'the same commit runs twice');
+  assert.equal(h.saving_min_week, 10);
+});
+
+test('the same commit runs twice: a sampled pull request run whose jobs were all skipped costs nothing, and prices the duplicate at zero', () => {
+  const rs = dupRuns(10);
+  const push = rs.find((r) => r.event === 'push');
+  const pr = rs.find((r) => r.event === 'pull_request');
+  // collect drops skipped jobs, so the pull request run's job list is empty; its run id comes with the sample.
+  const jobsPerRun = [[job({ steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 })], []];
+  const a = audit([{ name: 'CI', runs: rs, jobsPerRun, runIds: [push.id, pr.id], file: dupFile("main, 'feat/*'", 'x') }]);
+  const [f] = find(a, 'the same commit runs twice');
+  assert.ok(!f || f.saving_min_week === 0, JSON.stringify(f));
+  const all = analyse('owner/repo', data({ workflows: [{ name: 'CI', runs: rs, jobsPerRun, runIds: [push.id, pr.id], file: dupFile("main, 'feat/*'", 'x') }] }));
+  assert.deepEqual(all.workflows[0].run_minutes_by_kind.pull_request, { minutes: 0, sampled: 1 });
+});
+
+test('the same commit runs twice: without a timed run of both kinds the mean prices it, and the evidence says so', () => {
+  const rs = dupRuns(5);
+  const push = rs.find((r) => r.event === 'push');
+  const a = audit([{ name: 'CI', runs: rs, jobsPerRun: [[job({ runId: push.id })]], file: dupFile("main, 'feat/*'", 'x') }]);
+  const [f] = find(a, 'the same commit runs twice');
+  assert.match(f.evidence, /no pull request run of a duplicated commit was timed in the sample, so each duplicate is priced at the workflow's mean run/);
+  // Neither kind timed (a sampled job that names no run): both are named as missing.
+  const [g] = find(audit([{ name: 'CI', runs: rs, file: dupFile("main, 'feat/*'", 'x') }]), 'the same commit runs twice');
+  assert.match(g.evidence, /no push or pull request run of a duplicated commit was timed/);
+});
+
+test('the same commit runs twice: runs collect timed for the rule alone price the duplicate when the newest successes hold none', () => {
+  const rs = dupRuns(10);
+  const push = rs.find((r) => r.event === 'push');
+  const pr = rs.find((r) => r.event === 'pull_request');
+  // The newest successes are of no duplicated commit (a job naming no run); the extra runs are.
+  const dup = [
+    { id: push.id, jobs: [job({ steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 })] },
+    { id: pr.id, jobs: [job({ steps: [['Publish preview', 60]], wait: 0, head: 0, tail: 0 })] },
+  ];
+  const a = audit([{ name: 'CI', runs: rs, dupRuns: dup, file: dupFile("main, 'feat/*'", 'x') }]);
+  const [f] = find(a, 'the same commit runs twice');
+  assert.ok(f, JSON.stringify(a.findings));
+  assert.equal(f.saving_min_week, 10);
+  assert.match(f.evidence, /the cheaper of the two is the pull request run, 60 s of job time \(the mean of 1 timed pull request run\)/);
+  // An extra run of a commit that did not run on both events does not price it.
+  const lone = run({ event: 'pull_request', sha: 'lone', branch: 'patch-1' });
+  const [g] = find(audit([{ name: 'CI', runs: [...rs, lone], dupRuns: [dup[0], { id: lone.id, jobs: dup[1].jobs }], file: dupFile("main, 'feat/*'", 'x') }]), 'the same commit runs twice');
+  assert.match(g.evidence, /no pull request run of a duplicated commit was timed/);
+});
+
 test('the same commit runs twice: under the weekly threshold is left alone', () => {
   const a = audit([{ name: 'CI', runs: dupRuns(THRESHOLDS.duplicateCommitsWeek - 1), file: dupFile("main, 'feat/*'", 'x') }]);
   assert.equal(find(a, 'the same commit runs twice').length, 0);
@@ -133,6 +206,23 @@ test('outdated runs keep going: overlapping pull request runs without cancel-in-
   const [f] = find(a, 'outdated runs keep going');
   assert.ok(f, JSON.stringify(a.findings));
   assert.match(f.evidence, /^3 pull request runs a week/);
+});
+
+test('outdated runs, split by event: each event counts its runs made outdated by a newer run of the same event', () => {
+  // Four pull_request runs and three pull_request_target runs on one branch, each set overlapping its own.
+  const pr = prRuns(4);
+  const target = Array.from({ length: 3 }, (_, i) => run({ event: 'pull_request_target', sha: `t${i}`, branch: 'fix/a', at: 5000 + i * 300, wall: 600 }));
+  const file = 'on: [pull_request, pull_request_target]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n';
+  const a = audit([{ name: 'CI', runs: [...pr, ...target], file }]);
+  const w = a.workflows.find((x) => x.workflow === 'CI');
+  assert.deepEqual(w.superseded_week_by_event, { pull_request: 3, pull_request_target: 2 });
+  assert.equal(w.superseded_week, 5, 'both events together, as before');
+  // The finding still counts both, with the same evidence text as before.
+  const [f] = find(a, 'outdated runs keep going');
+  assert.match(f.evidence, /^5 pull request runs a week were still running when a newer push to the same branch started a new run/);
+  // A workflow on pull_request alone: the split holds every run on its own event.
+  const only = audit([{ name: 'CI', runs: prRuns(4), file: prFile(false) }]).workflows.find((x) => x.workflow === 'CI');
+  assert.deepEqual(only.superseded_week_by_event, { pull_request: 3, pull_request_target: 0 });
 });
 
 test('outdated runs keep going: cancel-in-progress, or runs that were cancelled, are left alone', () => {
@@ -149,6 +239,53 @@ test('reruns: one repository-level finding across workflows', () => {
   assert.equal(f.length, 1);
   assert.equal(f[0].workflow, 'all workflows');
   assert.match(f[0].evidence, /^2 re-attempted runs/);
+});
+
+// A run's jobs of every attempt, as the jobs API lists them with filter=all: attempt 2 lists every
+// job again, the ones kept from attempt 1 with attempt 1's times.
+const attempts = (keptSeconds, rerunSeconds) => {
+  const a1 = [
+    { ...job({ steps: [['Run tests', keptSeconds]], wait: 0, head: 0, tail: 0 }), name: 'kept', run_attempt: 1 },
+    { ...job({ steps: [['Run tests', rerunSeconds]], wait: 0, head: 0, tail: 0 }), name: 'flaky', run_attempt: 1, conclusion: 'failure' },
+  ];
+  const again = { ...job({ steps: [['Run tests', rerunSeconds]], wait: 0, head: 0, tail: 0, at: 3600 }), name: 'flaky', run_attempt: 2 };
+  return [...a1, { ...a1[0], run_attempt: 2 }, again];
+};
+
+test('rerunSeconds: only the jobs a later attempt ran count, not the ones it kept from an earlier attempt', () => {
+  assert.equal(rerunSeconds(attempts(600, 60)), 60);
+  // Re-running every job counts every job.
+  const all = attempts(600, 60).map((j, i) => (i === 2 ? { ...j, started_at: t(3600), completed_at: t(4200) } : j));
+  assert.equal(rerunSeconds(all), 660);
+  assert.equal(rerunSeconds([]), 0);
+  // Two jobs of one name that a later attempt started in the same second are two jobs.
+  const twin = { ...job({ steps: [['Run tests', 60]], wait: 0, head: 0, tail: 0, at: 3600 }), name: 'test', run_attempt: 2 };
+  assert.equal(rerunSeconds([...attempts(600, 60), twin, { ...twin }]), 180);
+  // Two kept jobs of one name and the same times are matched one for one: neither counts, and a
+  // third copy in the later attempt does.
+  const kept = { ...job({ steps: [['Run tests', 30]], wait: 0, head: 0, tail: 0 }), name: 'test', run_attempt: 1 };
+  assert.equal(rerunSeconds([kept, { ...kept }, { ...kept, run_attempt: 2 }, { ...kept, run_attempt: 2 }]), 0);
+  assert.equal(rerunSeconds([kept, { ...kept, run_attempt: 2 }, { ...kept, run_attempt: 2 }]), 30);
+  // A job kept through two reruns is a copy of the attempt before each time.
+  assert.equal(rerunSeconds([...attempts(600, 60), ...attempts(600, 60).filter((j) => j.run_attempt === 2).map((j) => ({ ...j, run_attempt: 3 }))]), 60);
+});
+
+test('reruns: priced at what the reruns read ran, not a whole run; a workflow with none read is priced at a whole run and said so', () => {
+  const ten = () => job({ steps: [['Run tests', 600]], wait: 0, head: 0, tail: 0 });
+  const a = audit([{ name: 'CI', runs: [run({ attempt: 2 }), run()], jobsPerRun: [[ten()]], rerunJobs: [attempts(600, 60)] }]);
+  const [f] = find(a, 'reruns');
+  assert.ok(f, JSON.stringify(a.findings));
+  assert.equal(f.saving_min_week, 1); // 1 rerun x the 1 minute it re-ran, not the 10-minute run
+  assert.equal(f.confidence, 'measured');
+  assert.match(f.evidence, /the later attempts of 1 read ran 60 s of job time each on the mean/);
+  const b = audit([
+    { name: 'CI', runs: [run({ attempt: 2 }), run()], jobsPerRun: [[ten()]], rerunJobs: [attempts(600, 60)] },
+    { name: 'Lint', path: '.github/workflows/lint.yml', runs: [run({ attempt: 2 }), run()], jobsPerRun: [[ten()]] },
+  ]);
+  const [g] = find(b, 'reruns');
+  assert.equal(g.saving_min_week, 11);
+  assert.equal(g.confidence, 'inferred');
+  assert.match(g.evidence, /1 rerun of Lint was not read and is priced at a whole run/);
 });
 
 test('matrix size: many jobs and many job-minutes per run is an option, not a fault; a small matrix is left alone', () => {

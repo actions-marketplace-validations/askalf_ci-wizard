@@ -8883,8 +8883,40 @@ function zipEntries(buf) {
   return entries;
 }
 
+// src/reusable.mjs
+var FILE = String.raw`\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml`;
+var LOCAL = new RegExp(String.raw`^\./(${FILE})$`);
+var REMOTE = new RegExp(String.raw`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(${FILE})@([^\s@]+)$`);
+var MAX_CALL_DEPTH = 4;
+function callKey(uses, base = null) {
+  const s = String(uses ?? "").trim();
+  const local = LOCAL.exec(s);
+  if (local) return base ? `${base.owner}/${base.repo}/${local[1]}@${base.ref}` : local[1];
+  const remote = REMOTE.exec(s);
+  return remote ? `${remote[1]}/${remote[2]}/${remote[3]}@${remote[4]}` : null;
+}
+var isRemoteKey = (key) => typeof key === "string" && !key.startsWith(".github/");
+function remoteParts(key) {
+  const m = isRemoteKey(key) ? /^([^/]+)\/([^/]+)\/(\.github\/workflows\/[^@]+)@(.+)$/.exec(key) : null;
+  return m ? { owner: m[1], repo: m[2], path: m[3], ref: m[4] } : null;
+}
+function callsOf(text, base = null) {
+  const doc = typeof text === "string" ? parseWorkflow(text) : {};
+  return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object" && typeof j.uses === "string").map(([job, j]) => ({ job, uses: j.uses, key: callKey(j.uses, base) }));
+}
+function calledText(key, { files = /* @__PURE__ */ new Map(), remote = /* @__PURE__ */ new Map() } = {}) {
+  if (!key) return void 0;
+  return isRemoteKey(key) ? remote.get(key) : files.get(key);
+}
+var baseOf = (key) => isRemoteKey(key) ? remoteParts(key) : null;
+
 // src/collect.mjs
 var encodePath = (path) => String(path).split("/").map(encodeURIComponent).join("/");
+var MAX_REUSABLE_READS = 12;
+var DUP_RUNS_PER_KIND = 2;
+var RERUNS_PER_WORKFLOW = 3;
+var PULL_REQUEST_EVENTS = /* @__PURE__ */ new Set(["pull_request", "pull_request_target"]);
+var kindOf = (r) => r.event === "push" ? "push" : PULL_REQUEST_EVENTS.has(r.event) ? "pull_request" : null;
 var LOCKFILES = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum", "Cargo.lock", "Gemfile.lock"];
 function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
   const groups = /* @__PURE__ */ new Map();
@@ -8907,8 +8939,10 @@ function groupRuns(runs, names = /* @__PURE__ */ new Map()) {
   for (const g of labelled) out.set(taken.get(g.name) > 1 && g.path ? `${g.name} (${g.path})` : g.name, g.rs);
   return out;
 }
-async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages = 5, maxScanFiles = 30, logs = true, artifacts = true, maxLogBytes = 8 * 1048576, maxArtifactBytes = 8 * 1048576, onProgress = () => {
+async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2, workflows = 8, only = [], now = /* @__PURE__ */ new Date(), maxPages: askedPages = 5, maxScanFiles = 30, logs = true, artifacts = true, maxLogBytes = 8 * 1048576, maxArtifactBytes = 8 * 1048576, onProgress = () => {
 } } = {}) {
+  const asked = Math.floor(Number(askedPages));
+  const maxPages = Number.isFinite(asked) ? Math.max(1, Math.min(10, asked)) : 1;
   const since = new Date(now.getTime() - days * 864e5).toISOString().replace(/\.\d{3}Z$/, "Z");
   const runs = [];
   let truncated = false;
@@ -8982,25 +9016,34 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   const top = wanted.length ? ranked.filter(([label, rs]) => wanted.some((n) => matches(label, rs, n))) : ranked.slice(0, workflows);
   const onlyMissing = wanted.length ? only.filter((n) => String(n).trim() && !ranked.some(([label, rs]) => matches(label, rs, n))) : [];
   const samples = /* @__PURE__ */ new Map();
+  const sampleRunIds = /* @__PURE__ */ new Map();
   const outcomeSamples = /* @__PURE__ */ new Map();
   const rawJobs = /* @__PURE__ */ new Map();
-  const jobsRaw = (r) => {
-    if (!rawJobs.has(r.id)) {
-      rawJobs.set(r.id, (async () => {
-        const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?per_page=100&page=${page}`;
-        const first2 = await client.get(url(1));
-        if (!first2) return null;
-        const jobs = [...first2.jobs || []];
-        const total2 = Number.isFinite(first2.total_count) ? first2.total_count : jobs.length;
-        const pages = Math.min(10, Math.ceil(total2 / 100));
-        if (pages > 1) {
-          const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
-          for (const d of rest) if (d) jobs.push(...d.jobs || []);
-        }
-        return { ...first2, jobs, complete: jobs.length >= total2 };
-      })());
+  const pagedJobs = async (r, query = "") => {
+    const url = (page) => `repos/${repo}/actions/runs/${r.id}/jobs?${query}per_page=100&page=${page}`;
+    const first2 = await client.get(url(1));
+    if (!first2) return null;
+    const jobs = [...first2.jobs || []];
+    const total2 = Number.isFinite(first2.total_count) ? first2.total_count : jobs.length;
+    const pages = Math.min(10, Math.ceil(total2 / 100));
+    if (pages > 1) {
+      const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => client.get(url(i + 2))));
+      for (const d of rest) if (d) jobs.push(...d.jobs || []);
     }
+    return { ...first2, jobs, complete: jobs.length >= total2 };
+  };
+  const jobsRaw = (r) => {
+    if (!rawJobs.has(r.id)) rawJobs.set(r.id, pagedJobs(r));
     return rawJobs.get(r.id);
+  };
+  const attemptsOf = async (r) => {
+    try {
+      const j = await pagedJobs(r, "filter=all&");
+      return j && j.complete ? j.jobs : null;
+    } catch (e) {
+      if (e instanceof RateLimitError) throw e;
+      return null;
+    }
   };
   const jobsOf3 = async (r) => {
     const j = await jobsRaw(r);
@@ -9012,8 +9055,24 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     onProgress(`timing ${wf} (${n + 1}/${top.length})`);
     const ok = rs.filter((r) => r.status === "completed" && r.conclusion === "success").slice(0, perWorkflow);
     const outcomes = ["failure", "cancelled", "timed_out"].map((outcome) => [outcome, rs.filter((r) => r.status === "completed" && r.conclusion === outcome).slice(0, perOutcome)]);
-    const [okJobs, ...outcomeJobs] = await Promise.all([
+    const kindsOfCommit = /* @__PURE__ */ new Map();
+    for (const r of rs) {
+      const kind = kindOf(r);
+      if (!kind) continue;
+      if (!kindsOfCommit.has(r.head_sha)) kindsOfCommit.set(r.head_sha, /* @__PURE__ */ new Set());
+      kindsOfCommit.get(r.head_sha).add(kind);
+    }
+    const ofDupCommit = (r) => kindOf(r) && (kindsOfCommit.get(r.head_sha) || /* @__PURE__ */ new Set()).size === 2;
+    const okIds = new Set(ok.map((r) => r.id));
+    const dupPicked = ["push", "pull_request"].flatMap((kind) => {
+      const held = ok.filter((r) => ofDupCommit(r) && kindOf(r) === kind).length;
+      return rs.filter((r) => !okIds.has(r.id) && r.status === "completed" && r.conclusion === "success" && kindOf(r) === kind && ofDupCommit(r)).slice(0, Math.max(0, DUP_RUNS_PER_KIND - held));
+    });
+    const rerunPicked = rs.filter((r) => r.status === "completed" && (r.run_attempt || 1) > 1).slice(0, RERUNS_PER_WORKFLOW);
+    const [okJobs, dupJobs, rerunJobs, ...outcomeJobs] = await Promise.all([
       Promise.all(ok.map(jobsOf3)),
+      Promise.all(dupPicked.map(jobsOf3)),
+      Promise.all(rerunPicked.map(attemptsOf)),
       ...outcomes.map(([, picked]) => Promise.all(picked.map(jobsOf3)))
     ]);
     const byOutcome = {};
@@ -9021,11 +9080,18 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
       const got = outcomeJobs[i].filter(Boolean);
       if (got.length) byOutcome[outcome] = got;
     });
-    return [wf, okJobs.filter(Boolean), byOutcome];
+    const okRuns = ok.map((r, i) => [r.id, okJobs[i]]).filter(([, jobs]) => jobs);
+    const dupRuns = dupPicked.map((r, i) => ({ id: r.id, jobs: dupJobs[i] })).filter((d) => d.jobs);
+    return [wf, okRuns.map(([, jobs]) => jobs), byOutcome, okRuns.map(([id]) => id), dupRuns, rerunJobs.filter(Boolean)];
   }));
-  for (const [wf, jobsPerRun, byOutcome] of timed) {
+  const dupSamples = /* @__PURE__ */ new Map();
+  const rerunSamples = /* @__PURE__ */ new Map();
+  for (const [wf, jobsPerRun, byOutcome, runIds, dupRuns, rerunJobs] of timed) {
     samples.set(wf, jobsPerRun);
+    sampleRunIds.set(wf, runIds);
     outcomeSamples.set(wf, byOutcome);
+    dupSamples.set(wf, dupRuns);
+    rerunSamples.set(wf, rerunJobs);
   }
   if (logs && typeof client.sizeOf === "function") {
     onProgress("reading log sizes");
@@ -9114,6 +9180,27 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
     else unreadable.push(path);
   });
   const scanned = { read: scanFiles.size, of: listed ? workflowPaths.length : null, unreadable };
+  const reusableFiles = /* @__PURE__ */ new Map();
+  let calls = [...scanFiles.values()].flatMap((text) => callsOf(text)).map((c) => c.key).filter(isRemoteKey);
+  for (let depth = 0; depth < MAX_CALL_DEPTH && calls.length; depth++) {
+    const batch = [...new Set(calls)].filter((k) => !reusableFiles.has(k)).slice(0, Math.max(0, MAX_REUSABLE_READS - reusableFiles.size));
+    if (!batch.length) break;
+    const texts = await Promise.all(batch.map(async (k) => {
+      const p = remoteParts(k);
+      try {
+        return await client.getRaw(`repos/${p.owner}/${p.repo}/contents/${encodePath(p.path)}?ref=${encodeURIComponent(p.ref)}`);
+      } catch (e) {
+        if (e instanceof RateLimitError) throw e;
+        return null;
+      }
+    }));
+    calls = [];
+    batch.forEach((k, i) => {
+      const text = typeof texts[i] === "string" ? texts[i] : null;
+      reusableFiles.set(k, text);
+      if (text) calls.push(...callsOf(text, remoteParts(k)).map((c) => c.key).filter(isRemoteKey));
+    });
+  }
   const defaultBranch = meta && typeof meta.default_branch === "string" ? meta.default_branch : null;
   const visibility = meta && typeof meta.visibility === "string" ? meta.visibility : meta && typeof meta.private === "boolean" ? meta.private ? "private" : "public" : null;
   const root = rootListing || [];
@@ -9121,7 +9208,7 @@ async function collect(client, repo, { days = 7, perWorkflow = 5, perOutcome = 2
   const lockfiles = LOCKFILES.filter((f) => names.has(f)).sort();
   onProgress("reading merge gates");
   const gates = await collectGates(client, repo, { runs, byWf, defaultBranch, rootNames: Array.isArray(rootListing) ? names : null, jobsRaw, settle, settled });
-  return { runs, byWf, samples, outcomeSamples, scanFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
+  return { runs, byWf, samples, sampleRunIds, outcomeSamples, dupSamples, rerunSamples, scanFiles, reusableFiles, scanned, coveredDays, truncated, since, files, lockfiles, defaultBranch, visibility, gates, only: wanted.length ? only : [], onlyMissing };
 }
 var PR_EVENTS = /* @__PURE__ */ new Set(["pull_request", "pull_request_target", "merge_group"]);
 var RENOVATE_FILES = ["renovate.json", "renovate.json5", ".renovaterc", ".renovaterc.json", ".renovaterc.json5"];
@@ -9138,11 +9225,11 @@ async function collectGates(client, repo, { runs, byWf, defaultBranch, rootNames
   const prRuns = [];
   let unfinishedOnly = false;
   for (const rs of byWf.values()) {
-    const done = rs.find((r) => PR_EVENTS.has(r.event) && r.status === "completed");
-    const any = done || rs.find((r) => PR_EVENTS.has(r.event));
+    const ok = rs.find((r) => PR_EVENTS.has(r.event) && r.status === "completed" && r.conclusion === "success");
+    const any = ok || rs.find((r) => PR_EVENTS.has(r.event) && r.status === "completed") || rs.find((r) => PR_EVENTS.has(r.event));
     if (!any) continue;
     prRuns.push(any);
-    if (!done) unfinishedOnly = true;
+    if (!ok) unfinishedOnly = true;
   }
   const [rules, branchInfo, githubDir, ...prJobLists] = await Promise.all([
     branch ? soft(client.get(`repos/${repo}/rules/branches/${branch}?per_page=100`)) : { ok: false, value: null },
@@ -9432,6 +9519,7 @@ function envTaint(env, outer) {
   }
   return out;
 }
+var isWriteAll = (p) => typeof p === "string" && p.trim().toLowerCase() === "write-all";
 function jobsOf2(doc) {
   return Object.entries(doc.jobs || {}).filter(([, j]) => j && typeof j === "object");
 }
@@ -9466,7 +9554,6 @@ function scanWorkflow(text) {
       }
     });
   }
-  const isWriteAll = (p) => typeof p === "string" && p.trim().toLowerCase() === "write-all";
   const jobs = jobsOf2(doc);
   const writeAll = isWriteAll(doc.permissions) ? ["(workflow)"] : jobs.filter(([, j]) => isWriteAll(j.permissions)).map(([id]) => id);
   const unscoped = doc.permissions === void 0 ? jobs.filter(([, j]) => j.permissions === void 0).map(([id]) => id) : [];
@@ -9474,8 +9561,27 @@ function scanWorkflow(text) {
 }
 var list = (xs, n = 5) => `${xs.slice(0, n).join("; ")}${xs.length > n ? ` and ${xs.length - n} more` : ""}`;
 var where = (paths) => paths.length === 1 ? paths[0] : `${paths.length} workflow files: ${list(paths, 4)}`;
-function scanFindings(files, { repo = null } = {}) {
-  const scans = [...files].map(([path, text]) => ({ path, ...scanWorkflow(text) })).filter((s) => s.parsed);
+function calledScoped(uses, base, { files, reusable }, path = /* @__PURE__ */ new Set(), depth = 0) {
+  const key = callKey(uses, base);
+  if (!key || path.has(key) || depth >= MAX_CALL_DEPTH) return false;
+  const text = calledText(key, { files, remote: reusable });
+  if (typeof text !== "string") return false;
+  const doc = parseWorkflow(text);
+  const jobs = jobsOf2(doc);
+  const chain = /* @__PURE__ */ new Set([...path, key]);
+  return jobs.length > 0 && jobs.every(([, j]) => {
+    const effective = j.permissions !== void 0 ? j.permissions : doc.permissions;
+    if (effective !== void 0 && !isWriteAll(effective)) return true;
+    return typeof j.uses === "string" && calledScoped(j.uses, baseOf(key), { files, reusable }, chain, depth + 1);
+  });
+}
+function scanFindings(files, { repo = null, reusable = /* @__PURE__ */ new Map() } = {}) {
+  const scans = [...files].map(([path, text]) => {
+    const scan = scanWorkflow(text);
+    const jobs = scan.unscoped.length ? parseWorkflow(text).jobs || {} : {};
+    const unscoped2 = scan.unscoped.filter((id) => !(jobs[id] && typeof jobs[id].uses === "string" && calledScoped(jobs[id].uses, null, { files, reusable })));
+    return { path, ...scan, unscoped: unscoped2 };
+  }).filter((s) => s.parsed);
   const F = [];
   const unpinned = scans.flatMap((s) => s.unpinned.map((u) => ({ ...u, path: s.path })));
   if (unpinned.length) {
@@ -9532,7 +9638,7 @@ function scanFindings(files, { repo = null } = {}) {
     const confirmed = writeAll.length > 0;
     const parts = [];
     if (writeAll.length) parts.push(`write-all in ${list(writeAll.map((s) => `${s.path} (${s.writeAll.join(", ")})`), 4)}`);
-    if (unscoped.length) parts.push(`no permissions block in ${list(unscoped.map((s) => s.path), 4)}, so its jobs get the repository's default token, which is write access on many repositories created before February 2023`);
+    if (unscoped.length) parts.push(`no permissions block for ${list(unscoped.map((s) => `${s.path} (job${s.unscoped.length === 1 ? "" : "s"} ${list(s.unscoped, 4)})`), 4)}, so ${unscoped.length === 1 && unscoped[0].unscoped.length === 1 ? "that job gets" : "those jobs get"} the repository's default token, which is write access on many repositories created before February 2023`);
     F.push({
       saving: 0,
       unit: "risk",
@@ -9607,31 +9713,49 @@ function runTargets(program, args) {
 }
 var GATE_LIKE = /\b(test|tests|lint|build|check|checks|verify|analy[sz]e|codeql|typecheck|types|dist|unit|e2e|ci|fuzz|fuzzing)\b/i;
 var list2 = (xs, n = 6) => `${xs.slice(0, n).join(", ")}${xs.length > n ? ` and ${xs.length - n} more` : ""}`;
-function fileFacts(scanFiles) {
+function fileFacts(scanFiles, reusable = /* @__PURE__ */ new Map()) {
   const onPr = [];
   let codeql = false;
+  const unread = /* @__PURE__ */ new Set();
+  const visit = (doc, base, seen, depth) => {
+    for (const job of Object.values(doc.jobs || {})) {
+      if (!job || typeof job !== "object") continue;
+      if (jobScansCode(job)) codeql = true;
+      if (typeof job.uses !== "string") continue;
+      const key = callKey(job.uses, base);
+      if (!key) {
+        unread.add(job.uses.trim());
+        continue;
+      }
+      if (seen.has(key) || depth >= MAX_CALL_DEPTH) continue;
+      seen.add(key);
+      const text = calledText(key, { files: scanFiles, remote: reusable });
+      if (typeof text === "string") visit(parseWorkflow(text), baseOf(key), seen, depth + 1);
+      else if (isRemoteKey(key)) unread.add(job.uses.trim());
+    }
+  };
   for (const [path, text] of scanFiles) {
     const doc = parseWorkflow(text);
     if (!Object.keys(doc).length) continue;
     if (triggersOf(doc).some((t) => PR_TRIGGERS.has(t))) onPr.push(path);
-    for (const job of Object.values(doc.jobs || {})) {
-      if (!job || typeof job !== "object") continue;
-      const steps = Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
-      const uses = steps.map((st) => String(st.uses || "").trim().toLowerCase());
-      const runs = steps.map((st) => String(st.run || ""));
-      const images = [job.container && typeof job.container === "object" ? job.container.image : job.container, ...uses.filter((u) => u.startsWith("docker://"))];
-      const commands = runs.flatMap((r) => shellCommands(r)).map(programWords).filter((c) => c.length);
-      const notCode = uses.some((u) => /^(ossf\/scorecard-action|zizmorcore\/|woodruffw\/zizmor|rhysd\/actionlint|raven-actions\/actionlint|boostsecurityio\/poutine)/.test(u)) || images.some((i) => NOT_CODE_TOOLS.has(imageName(i))) || commands.some(([program, ...args]) => NOT_CODE_TOOLS.has(program.toLowerCase()) || runTargets(program, args).some((a) => NOT_CODE_TOOLS.has(imageName(a))));
-      if (uses.some((u) => CODE_SCANNERS.test(u)) || !notCode && uses.some((u) => u.startsWith("github/codeql-action/upload-sarif@")) || images.some((i) => SCANNER_IMAGES.has(imageName(i))) || commands.some((c) => SCAN_COMMAND.test(c.join(" ")))) codeql = true;
-    }
+    visit(doc, null, /* @__PURE__ */ new Set(), 0);
   }
-  return { onPr, codeql };
+  return { onPr, codeql, unread: [...unread].sort() };
 }
-function gateFindings(gates, { scanFiles = /* @__PURE__ */ new Map(), scanned = null, visibility = null } = {}) {
+function jobScansCode(job) {
+  const steps = Array.isArray(job.steps) ? job.steps.filter((st) => st && typeof st === "object") : [];
+  const uses = steps.map((st) => String(st.uses || "").trim().toLowerCase());
+  const runs = steps.map((st) => String(st.run || ""));
+  const images = [job.container && typeof job.container === "object" ? job.container.image : job.container, ...uses.filter((u) => u.startsWith("docker://"))];
+  const commands = runs.flatMap((r) => shellCommands(r)).map(programWords).filter((c) => c.length);
+  const notCode = uses.some((u) => /^(ossf\/scorecard-action|zizmorcore\/|woodruffw\/zizmor|rhysd\/actionlint|raven-actions\/actionlint|boostsecurityio\/poutine)/.test(u)) || images.some((i) => NOT_CODE_TOOLS.has(imageName(i))) || commands.some(([program, ...args]) => NOT_CODE_TOOLS.has(program.toLowerCase()) || runTargets(program, args).some((a) => NOT_CODE_TOOLS.has(imageName(a))));
+  return uses.some((u) => CODE_SCANNERS.test(u)) || !notCode && uses.some((u) => u.startsWith("github/codeql-action/upload-sarif@")) || images.some((i) => SCANNER_IMAGES.has(imageName(i))) || commands.some((c) => SCAN_COMMAND.test(c.join(" ")));
+}
+function gateFindings(gates, { scanFiles = /* @__PURE__ */ new Map(), reusable = /* @__PURE__ */ new Map(), scanned = null, visibility = null } = {}) {
   if (!gates) return [];
   const F = [];
   const branch = gates.branch || "the default branch";
-  const files = fileFacts(scanFiles);
+  const files = fileFacts(scanFiles, reusable);
   const listedAll = Boolean(scanned && scanned.of !== null && scanned.of !== void 0 && scanned.read === scanned.of);
   const prChecks = gates.pr_checks || [];
   const prSeen = gates.pr_runs_read > 0;
@@ -9703,7 +9827,7 @@ function gateFindings(gates, { scanFiles = /* @__PURE__ */ new Map(), scanned = 
       if (unjudged.length && missingFinding) missingFinding.evidence += `; ${list2(unjudged.map((u) => `"${u}"`))} ${unjudged.length === 1 ? "is" : "are"} not bound to GitHub Actions, so another app may report ${unjudged.length === 1 ? "it" : "them"}, and ${unjudged.length === 1 ? "it was" : "they were"} not judged`;
     }
   }
-  if (listedAll && !files.codeql && !gates.code_scanning_runs) {
+  if (listedAll && !files.codeql && !gates.code_scanning_runs && !files.unread.length) {
     const paid = visibility && visibility !== "public";
     F.push({
       saving: 0,
@@ -9999,10 +10123,35 @@ function duplicateCommits(workflowRuns) {
   }
   return [...eventsByCommit.values()].filter((events) => events.has("push") && (events.has("pull_request") || events.has("pull_request_target"))).length;
 }
-function outdatedRuns(workflowRuns) {
+function rerunSeconds(jobs) {
+  const byAttempt = /* @__PURE__ */ new Map();
+  for (const j of jobs || []) {
+    if (!j || !j.started_at || !j.completed_at || j.conclusion === "skipped") continue;
+    const n = j.run_attempt || 1;
+    if (!byAttempt.has(n)) byAttempt.set(n, []);
+    byAttempt.get(n).push(j);
+  }
+  const keyOf = (j) => `${j.name}\0${j.started_at}\0${j.completed_at}`;
+  let before = /* @__PURE__ */ new Map();
+  let total = 0;
+  for (const n of [...byAttempt.keys()].sort((a, b) => a - b)) {
+    const unmatched = new Map(before);
+    const here = /* @__PURE__ */ new Map();
+    for (const j of byAttempt.get(n)) {
+      const key = keyOf(j);
+      here.set(key, (here.get(key) || 0) + 1);
+      if (n === 1) continue;
+      if ((unmatched.get(key) || 0) > 0) unmatched.set(key, unmatched.get(key) - 1);
+      else total += secs(j.started_at, j.completed_at);
+    }
+    before = here;
+  }
+  return total;
+}
+function outdatedRuns(workflowRuns, events = PR_EVENTS2) {
   const runsByBranch = /* @__PURE__ */ new Map();
   for (const r of workflowRuns) {
-    if (!PR_EVENTS2.has(r.event) || !r.run_started_at) continue;
+    if (!events.has(r.event) || !r.run_started_at) continue;
     if (!runsByBranch.has(r.head_branch)) runsByBranch.set(r.head_branch, []);
     runsByBranch.get(r.head_branch).push(r);
   }
@@ -10020,7 +10169,7 @@ function outdatedRuns(workflowRuns) {
 function longestSteps(workStepSeconds) {
   return [...workStepSeconds.entries()].map(([step, seconds]) => ({ step, median_s: median(seconds), seen: seconds.length })).sort((a, b) => b.median_s - a.median_s || (a.step < b.step ? 1 : a.step > b.step ? -1 : 0) || b.seen - a.seen).slice(0, 3).map((s) => ({ ...s, median_s: Math.round(s.median_s) }));
 }
-function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, weekFactor, repo = "owner/repo", outcomeRuns = {}) {
+function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, weekFactor, repo = "owner/repo", outcomeRuns = {}, sampleRunIds = [], { dupRuns = [], rerunJobs = [] } = {}) {
   const doc = parseWorkflow(fileText);
   const facts = workflowFacts(doc);
   const timing = timeJobs(sampledRuns, stepCommands(doc));
@@ -10046,6 +10195,27 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
   const { sameTestsOf, artifactOf } = evidenceOf(sampledRuns[0] || [], jobRuns);
   const sampledCount = sampledRuns.length;
   const medianRunSeconds = median(timing.jobSecondsPerRun);
+  const runById = new Map(workflowRuns.map((r) => [r.id, r]));
+  const eventsOfCommit = /* @__PURE__ */ new Map();
+  for (const r of workflowRuns) {
+    if (!eventsOfCommit.has(r.head_sha)) eventsOfCommit.set(r.head_sha, /* @__PURE__ */ new Set());
+    eventsOfCommit.get(r.head_sha).add(PR_EVENTS2.has(r.event) ? "pull_request" : r.event);
+  }
+  const secondsByKind = { push: [], pull_request: [] };
+  sampledRuns.forEach((jobs, i) => {
+    const r = runById.get(sampleRunIds[i] ?? ((jobs || []).find((j) => j.run_id != null) || {}).run_id);
+    if (!r) return;
+    const kind = r.event === "push" ? "push" : PR_EVENTS2.has(r.event) ? "pull_request" : null;
+    const events2 = eventsOfCommit.get(r.head_sha);
+    if (kind && events2.has("push") && events2.has("pull_request")) secondsByKind[kind].push(timing.jobSecondsPerRun[i]);
+  });
+  for (const { id, jobs } of dupRuns) {
+    const r = runById.get(id);
+    const kind = r ? r.event === "push" ? "push" : PR_EVENTS2.has(r.event) ? "pull_request" : null : null;
+    const events2 = r ? eventsOfCommit.get(r.head_sha) : null;
+    if (kind && events2.has("push") && events2.has("pull_request")) secondsByKind[kind].push(sum((jobs || []).map((j) => secs(j.started_at, j.completed_at))));
+  }
+  const kindCost = (xs) => xs.length ? { minutes: round(mean(xs) / 60, 2), sampled: xs.length } : null;
   const successfulWalls = workflowRuns.filter((r) => r.status === "completed" && r.conclusion === "success" && r.run_started_at).map((r) => secs(r.run_started_at, r.updated_at));
   const reruns = workflowRuns.filter((r) => (r.run_attempt || 1) > 1).length;
   const failures = workflowRuns.filter((r) => r.conclusion === "failure").length;
@@ -10092,6 +10262,7 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
     // per-run savings multiply by.
     job_minutes_per_run: round(medianRunSeconds / 60, 2),
     job_minutes_per_run_mean: round(successSeconds / 60, 2),
+    run_minutes_by_kind: { push: kindCost(secondsByKind.push), pull_request: kindCost(secondsByKind.pull_request) },
     job_minutes_week: round(weekFactor * weekSeconds / 60, 1),
     billed_minutes_per_run: billedPerRun,
     billed_minutes_week: round(weekFactor * weekBilled, 1),
@@ -10115,12 +10286,16 @@ function measureWorkflow(workflowName, workflowRuns, sampledRuns, fileText, week
     wall_p50: pct(successfulWalls, 0.5),
     wall_p90: pct(successfulWalls, 0.9),
     superseded_week: perWeek(outdatedRuns(workflowRuns)),
+    // The same count for each pull request event alone: a fix that cancels one event's runs saves that one's.
+    superseded_week_by_event: Object.fromEntries([...PR_EVENTS2].map((e) => [e, perWeek(outdatedRuns(workflowRuns, /* @__PURE__ */ new Set([e])))])),
     has_concurrency: facts.hasConcurrency,
     cancels: facts.cancels,
     top_steps: longestSteps(timing.workStepSeconds),
     longest_job_s: timing.jobLengths.length ? Math.max(...timing.jobLengths) : 0,
     median_job_s: median(timing.jobLengths),
     reruns_raw: reruns,
+    // What one rerun ran, from the re-attempted runs read: null when none was.
+    rerun_minutes: kindCost(rerunJobs.map(rerunSeconds)),
     npm_install_no_ci: facts.npmInstallNoCi,
     prefer_offline: facts.preferOffline,
     caches_node_modules: facts.cachesNodeModules,
@@ -10402,7 +10577,17 @@ function workflowFindings(w, { lockKey, hasLock, lockfiles = [], defaultBranch =
       why += `; the concurrency group (${cg}) keys pull requests by number and pushes by commit, so neither run cancels the other`;
     }
     const fix = extra.length ? "drop those patterns from the push trigger if every such branch gets a pull request, or key the concurrency group on the commit for both events so the second run cancels the first" : "run on push only for the default branch and on pull_request for everything else, or share one concurrency group per commit";
-    add(w.dup_commits_week * (w.job_minutes_per_run_mean ?? w.job_minutes_per_run), "the same commit runs twice", why, fix, {
+    const byKind = w.run_minutes_by_kind || {};
+    let perCommit = w.job_minutes_per_run_mean ?? w.job_minutes_per_run;
+    if (byKind.push && byKind.pull_request) {
+      const [kind, cost] = byKind.push.minutes <= byKind.pull_request.minutes ? ["push", byKind.push] : ["pull request", byKind.pull_request];
+      perCommit = cost.minutes;
+      why += `; the cheaper of the two is the ${kind} run, ${fmtS(cost.minutes * 60)} of job time (the mean of ${cost.sampled} timed ${kind} run${cost.sampled === 1 ? "" : "s"}), the least that dropping either run saves, so the saving counts that run`;
+    } else {
+      const missing = byKind.push ? "pull request" : byKind.pull_request ? "push" : "push or pull request";
+      why += `; no ${missing} run of a duplicated commit was timed in the sample, so each duplicate is priced at the workflow's mean run, which overstates it if one of the two runs skips jobs`;
+    }
+    add(w.dup_commits_week * perCommit, "the same commit runs twice", why, fix, {
       confidence,
       tradeoff: "a branch pushed without a pull request then runs no CI until one is opened (trigger fix), or one of the two runs is cancelled and shows as such (concurrency fix)",
       example: extra.length ? ONE_RUN_PER_COMMIT : triggerExample(w.push_branches, defaultBranch)
@@ -10587,15 +10772,29 @@ function repoFindings(workflows) {
   }
   const reruns = sum(workflows.map((w) => w.reruns_raw));
   if (reruns) {
+    const rerunning = workflows.filter((w) => w.reruns_raw);
+    const read = rerunning.filter((w) => w.rerun_minutes);
+    const unread = rerunning.filter((w) => !w.rerun_minutes);
+    const perRerun = (w) => w.rerun_minutes ? w.rerun_minutes.minutes : w.job_minutes_per_run_mean ?? w.job_minutes_per_run;
+    let evidence = `${reruns} re-attempted run${reruns === 1 ? "" : "s"} in the window across the sampled workflows`;
+    if (read.length) {
+      const n = sum(read.map((w) => w.rerun_minutes.sampled));
+      const minutes = sum(read.map((w) => w.rerun_minutes.minutes * w.rerun_minutes.sampled)) / n;
+      evidence += `; the later attempts of ${n} read ran ${fmtS(minutes * 60)} of job time each on the mean (a rerun of the failed jobs alone keeps the jobs that passed), which prices the reruns of ${read.map((w) => w.workflow).join(", ")}`;
+    }
+    if (unread.length) {
+      const n = sum(unread.map((w) => w.reruns_raw));
+      evidence += `; ${n} rerun${n === 1 ? "" : "s"} of ${unread.map((w) => w.workflow).join(", ")} ${n === 1 ? "was" : "were"} not read and ${n === 1 ? "is" : "are"} priced at a whole run, which overstates a rerun of the failed jobs alone`;
+    }
     F.push({
-      saving: sum(workflows.map((w) => w.reruns_week * (w.job_minutes_per_run_mean ?? w.job_minutes_per_run))),
+      saving: sum(rerunning.map((w) => w.reruns_week * perRerun(w))),
       workflow: "all workflows",
       what: "reruns",
-      evidence: `${reruns} re-attempted run${reruns === 1 ? "" : "s"} in the window across the sampled workflows`,
+      evidence,
       fix: "find the flaky step from the failed attempts and fix or quarantine it; each rerun also costs a developer a wait",
       tradeoff: "quarantining hides a real failure until someone looks",
       example: "",
-      confidence: "measured",
+      confidence: unread.length ? "inferred" : "measured",
       unit: "job"
     });
   }
@@ -10687,10 +10886,13 @@ function analyseParsed(repo, data) {
     if (!jobsPerRun.length) continue;
     const rs = data.byWf.get(wf);
     const path = String(rs[0].path || "").split("@")[0];
-    workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week, repo, data.outcomeSamples && data.outcomeSamples.get(wf) || {}));
+    workflows.push(measureWorkflow(wf, rs, jobsPerRun, data.files.get(path) || "", week, repo, data.outcomeSamples && data.outcomeSamples.get(wf) || {}, data.sampleRunIds && data.sampleRunIds.get(wf) || [], {
+      dupRuns: data.dupSamples && data.dupSamples.get(wf) || [],
+      rerunJobs: data.rerunSamples && data.rerunSamples.get(wf) || []
+    }));
   }
   workflows.sort((a, b) => b.job_minutes_week - a.job_minutes_week);
-  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map(), { repo }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
+  const raw = [...workflows.flatMap((w) => workflowFindings(w, { lockKey, hasLock, lockfiles: data.lockfiles, defaultBranch: data.defaultBranch || null, isPublic: data.visibility === "public" ? true : data.visibility ? "private" : false })), ...repoFindings(workflows), ...runnerReuseFinding(data.samples || /* @__PURE__ */ new Map()), ...scanFindings(data.scanFiles || /* @__PURE__ */ new Map(), { repo, reusable: data.reusableFiles || /* @__PURE__ */ new Map() }), ...gateFindings(data.gates, { scanFiles: data.scanFiles || /* @__PURE__ */ new Map(), reusable: data.reusableFiles || /* @__PURE__ */ new Map(), scanned: data.scanned, visibility: data.visibility })];
   const findings = groupFindings(raw).filter((f) => f.unit === "wait" || f.unit === "risk" || f.unit === "guard" || f.unit === "log" || f.what === "an artifact that duplicates another upload" || f.saving >= T.minSavingWeek).map((f) => ({
     saving_min_week: round(f.saving, 1),
     unit: f.unit || "job",
@@ -11174,14 +11376,19 @@ function compare2(before, after) {
 }
 
 // src/version.mjs
-var VERSION = "0.3.0";
+var VERSION = "0.4.4";
 
 // src/index.mjs
+var MAX_RUNS_LIMIT = 1e3;
+var MAX_RUNS_DEFAULT = 500;
 var REPO_RE = /^(?!\.{1,2}\/)[A-Za-z0-9_.-]+\/(?!\.{1,2}$)[A-Za-z0-9_.-]+$/;
-async function audit({ repo, token, fetchImpl, baseUrl, days = 7, workflows = 8, perWorkflow = 5, only = [], now, client, onProgress } = {}) {
+async function audit({ repo, token, fetchImpl, baseUrl, days = 7, workflows = 8, perWorkflow = 5, maxRuns = MAX_RUNS_DEFAULT, only = [], now, client, onProgress } = {}) {
   if (!REPO_RE.test(String(repo))) throw new Error(`not an owner/name repository: ${repo}`);
+  if (!Number.isInteger(maxRuns) || maxRuns < 100 || maxRuns > MAX_RUNS_LIMIT || maxRuns % 100 !== 0) {
+    throw new Error(`maxRuns must be a multiple of 100 from 100 to ${MAX_RUNS_LIMIT}, got ${maxRuns}`);
+  }
   const c = client || createClient({ token, fetchImpl, baseUrl });
-  const data = await collect(c, repo, { days, workflows, perWorkflow, only, now, onProgress });
+  const data = await collect(c, repo, { days, workflows, perWorkflow, only, now, onProgress, maxPages: maxRuns / 100 });
   if (!data) return null;
   const a = analyse(repo, data);
   a.api_calls = c.calls;
@@ -11214,7 +11421,7 @@ function rerunWithEnvProxy({ env = process.env, argv = process.argv, execArgv = 
 }
 
 // src/cli.mjs
-var USAGE = `usage: ci-wizard [owner/repo] [--days 7] [--workflows 8] [--per-workflow 5] [--only NAME] [--json] [--html out.html] [--save out.json]
+var USAGE = `usage: ci-wizard [owner/repo] [--days 7] [--max-runs 500] [--workflows 8] [--per-workflow 5] [--only NAME] [--json] [--html out.html] [--save out.json]
        ci-wizard compare before.json after.json
        ci-wizard --version
 
@@ -11223,7 +11430,11 @@ the CI time goes and what to fix first. The repository is owner/repo or a GitHub
 it is the origin remote of the git checkout in the current directory.
 Token: GITHUB_TOKEN or GH_TOKEN, else \`gh auth token\`.
 
-  --days N           days of runs to read (default 7; up to 500 runs are read)
+  --days N           days of runs to read (default 7; up to --max-runs runs are read)
+  --max-runs N       the most runs read from those days: a multiple of 100 up to 1000 (default
+                     500). A busy repository fills 500 in a day or two. Each 100 more is one more
+                     page of the runs list, and other calls can rise too when the longer window
+                     changes which workflows are the busiest.
   --workflows N      busiest workflows to time job by job (default 8)
   --per-workflow N   newest successful runs of each to time (default 5)
   --only NAME        time only these workflows, by the name GitHub shows (repeat it, or
@@ -11310,6 +11521,7 @@ async function main(argv = process.argv.slice(2), { env = process.env, stdout = 
         workflows: { type: "string", default: "8" },
         only: { type: "string", multiple: true, default: [] },
         "per-workflow": { type: "string", default: "5" },
+        "max-runs": { type: "string", default: "500" },
         json: { type: "boolean", default: false },
         html: { type: "string" },
         save: { type: "string" },
@@ -11363,11 +11575,13 @@ ${USAGE}
     stderr.write(`ci-wizard: auditing ${repo} (the origin of this checkout)
 `);
   }
-  let days, workflows, perWorkflow;
+  let days, workflows, perWorkflow, maxRuns;
   try {
     days = positiveNumber("days", values.days);
     workflows = positiveNumber("workflows", values.workflows, { integer: true });
     perWorkflow = positiveNumber("per-workflow", values["per-workflow"], { integer: true });
+    maxRuns = positiveNumber("max-runs", values["max-runs"], { integer: true });
+    if (maxRuns % 100 !== 0 || maxRuns > MAX_RUNS_LIMIT) throw new Error(`--max-runs must be a multiple of 100 up to ${MAX_RUNS_LIMIT}, got ${values["max-runs"]}`);
   } catch (err) {
     stderr.write(`${err.message}
 `);
@@ -11382,7 +11596,7 @@ ${USAGE}
   let a;
   try {
     const only = values.only.flatMap((v) => v.split(",")).map((v) => v.trim()).filter(Boolean);
-    a = await audit({ repo, token, fetchImpl, baseUrl: apiBase(env), days, workflows, perWorkflow, only, onProgress });
+    a = await audit({ repo, token, fetchImpl, baseUrl: apiBase(env), days, workflows, perWorkflow, maxRuns, only, onProgress });
   } catch (err) {
     if (live) stderr.write("\r\x1B[K");
     stderr.write(`ci-wizard: ${err.message}

@@ -25,8 +25,9 @@ successful runs, and failed, cancelled and timed-out runs at the mean of up to t
 each, since a failure often stops early and a timeout runs to its limit. An outcome with no run
 sampled is costed like a success and marked (`cost_by_outcome`). Runs that ran no job (skipped,
 waiting for approval, failed to start, stale) cost nothing. The typical run in the table is the
-median successful run; the savings that multiply a per-run cost (duplicates, outdated runs, reruns)
-use the mean, because they add up to a total.
+median successful run; the savings that multiply a per-run cost (duplicates, outdated runs) use
+the mean, because they add up to a total. A rerun is priced at what its later attempts ran
+(below), not at a whole run.
 
 **Estimates.** Weekly figures scale the sampled window to 7 days. A saving is a formula over
 measured time, never the result of running the fix; the formulas are below. Thresholds live in
@@ -295,7 +296,15 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
   (the evidence names them), measured otherwise. A concurrency group keyed on the pull request
   number is named too: it puts the push run (keyed by commit) and the pull request run in
   different groups, so neither cancels the other.
-- **Estimate** the duplicate commits a week, times job-minutes per run.
+- **Estimate** the duplicate commits a week, times the cheaper of the two runs: the mean job time
+  of the sampled push runs, or of the sampled pull request runs, whichever is less, counting only
+  runs of commits that ran on both. Where the newest successful runs hold fewer than two of a kind
+  from such commits, older successful runs of that kind from such commits are timed for this rule
+  until there are two, so the newest runs need not hold one. A job a run skips by an `if:` costs
+  it nothing, so a pull request run that skips the tests is priced as the short run it is, and a
+  pull request from a fork, which has no push run here, does not price it. Without a timed run of
+  both kinds among the duplicated commits, the workflow's mean run prices it, and the evidence
+  says so.
 - **Branches** "beyond the default branch" uses the repository's default branch as the API reports
   it, or main and master when it cannot be read. The push-trigger example names that branch, and
   when it is unknown says to fill it in, rather than guessing `main`.
@@ -315,6 +324,10 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 - **Fix** a concurrency group per branch with `cancel-in-progress: true`. *Trade-off:* a
   workflow whose runs must all finish (a status that counts every run, a deploy) should not
   cancel; queued runs can pile up as cancelled.
+- **Counted** over `pull_request` and `pull_request_target` runs together (`superseded_week` in
+  the JSON report). `superseded_week_by_event` gives each event alone, counting only its runs made
+  outdated by a newer run of the same event: what a concurrency group keyed to that event would
+  cancel. A workflow on both events can have a total that is not the sum of the two.
 
 ## matrix size
 
@@ -521,9 +534,13 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 - **Fires when** a workflow or job sets `permissions: write-all` (confirmed), or a workflow has no
   top-level `permissions:` and a job without its own (inferred: the job gets the repository's
   default token, which the audit cannot read; write access on many repositories created before
-  February 2023). A job that calls a reusable workflow counts the same way: with no permissions of
-  its own it hands the called workflow the caller's token, which that workflow can narrow but the
-  audit does not read.
+  February 2023). A job that calls a reusable workflow with no permissions of its own hands the
+  called workflow the caller's token, and the called workflow can narrow it: the called file is
+  read (this repository's own, or another repository's at the called ref, up to four calls deep),
+  and the call is left alone when every job of that file has narrowed permissions: its own block,
+  or else the file's top-level one (a job's block overrides the default either way), and never
+  `write-all`, which narrows nothing. A job of it that is itself a call counts when the file it
+  calls does. A call whose file could not be read counts as unscoped. The evidence names the jobs.
 - **Fix** a read-only default at the top of each workflow (`contents: read`) and each job granted
   only what it uses. *Trade-off:* a job that needs more must name it, so a missing grant shows as a
   403 the first time it runs.
@@ -544,9 +561,11 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 ## required checks no pull request reports
 
 - **Fires when** a required check bound to GitHub Actions (integration 15368) matches no
-  job of the newest completed pull request run of any workflow in the window (a run still going
-  may not have created all its jobs; a workflow with only an unfinished run leaves the absence
-  unknown). A job's name is the check
+  job of the newest successful pull request run of any workflow in the window. Only a successful
+  run created every job it would: a run still going, a cancelled one, one waiting for a
+  maintainer's approval or one that failed stops before its later jobs, and a matrix behind
+  `needs:` is never expanded into the names a required check matches. A workflow with no
+  successful pull request run in the window leaves the absence unknown. A job's name is the check
   Actions reports: `name (value)` for a matrix leg, `caller / job` for a reusable workflow's job, and
   a skipped job still reports. GitHub waits for a required check until it reports, so a pull
   request without it cannot merge unless the rule is bypassed.
@@ -581,7 +600,12 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 ## no code scanning
 
 - **Fires when** every workflow file was read, no job runs a code scanner, and no code
-  scanning default-setup run (`dynamic/github-code-scanning`) is in the window. A code scanner is,
+  scanning default-setup run (`dynamic/github-code-scanning`) is in the window. A job that calls a
+  reusable workflow runs a scanner when the called file does (this repository's own, or another
+  repository's read at the called ref, up to four calls deep); when a called file of another
+  repository could not be read, or a call cannot be resolved (an expression), whether it scans is
+  unknown and the finding is not raised. A code
+  scanner is,
   read from the parsed steps (a commented-out step does not count):
   - CodeQL (`github/codeql-action/init` or `/analyze`);
   - Semgrep, Snyk, SonarSource or Bearer, by their action, their container image, or their
@@ -629,9 +653,18 @@ that runs on a clock, a dispatch or another workflow, the report shows no wait.
 
 ## reruns
 
-- **Fires when** any sampled run was re-attempted (run attempt above 1). One finding for the
-  repository.
-- **Confidence** measured.
-- **Estimate** re-attempted runs a week, times each workflow's job-minutes per run.
+- **Fires when** any run of a sampled workflow was re-attempted (run attempt above 1). One
+  finding for the repository.
+- **Confidence** measured when a rerun of every such workflow was read; inferred otherwise, and
+  the evidence names the workflows priced at a whole run.
+- **Estimate** re-attempted runs a week, times what a rerun ran: the jobs of every attempt of up
+  to 3 completed re-attempted runs of each workflow are read (`jobs?filter=all`), and a job of a
+  later attempt counts unless it is a copy of a job of the attempt before it (the same name, start
+  and end), each job of that attempt matching one copy at most, so two jobs that share a name and
+  a start second each count. Re-running only the failed jobs lists every job again under the new
+  attempt, the ones that passed with their first times, so a rerun of one failed job of a large
+  matrix costs that job, not the matrix. A workflow none of whose reruns was read (none had completed, or the
+  list could not be read whole) prices them at its mean run, which overstates a rerun of the
+  failed jobs alone.
 - **Fix** find the flaky step from the failed attempts and fix or quarantine it. *Trade-off:*
   quarantining hides a real failure until someone looks.

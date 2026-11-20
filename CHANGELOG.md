@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
+
+- The README, rewritten: the one-line `npx` and a picture of the HTML report from a real audit up
+  front, every CLI option in a table, a "Rate limits" section (the one the CLI's rate-limit hint
+  names), and one section for requirements and limits. The picture's address is absolute, so it
+  shows on npm too. No code changed.
+
+## 0.4.3
+
+- `--max-runs N` (CLI) and `maxRuns` (`audit()`): the most workflow runs read from the window, a
+  multiple of 100 up to 1000, the most GitHub serves for a runs list filtered by date. The default
+  stays 500. A busy repository fills 500 runs in a day or two, so its weekly figures rest on a short
+  window; 1000 covers about twice as much. Each 100 more runs is one more page of the runs list;
+  the audit's other calls (jobs, files, logs of the sampled workflows) can rise too when the longer
+  window changes which workflows are the busiest. The GitHub Action still reads 500.
+
+## 0.4.2
+
+- The JSON report gives each workflow's outdated pull request runs per event:
+  `superseded_week_by_event` (`pull_request`, `pull_request_target`), beside the total
+  `superseded_week` the **outdated runs keep going** rule reads. Each event counts its runs made
+  outdated by a newer run of the same event, what a concurrency group keyed to that event cancels,
+  so a fix for one event's runs can be priced on its own. The rule, its evidence and its saving
+  are unchanged.
+
+## 0.4.1
+
+Two savings that 0.4.0 overstated, found by auditing large public repositories with it:
+
+- **reruns** priced each re-attempted run at a whole run. Re-running only the failed jobs lists
+  every job again under the new attempt, the ones that passed with their first times, so on a
+  35-job matrix where one job failed and was re-run, the rule counted 35 jobs for the work of
+  one. Now the jobs of every attempt of up to 3 re-attempted runs per sampled workflow are read
+  (one new request form, `jobs?filter=all`), and a rerun costs the jobs its later attempts ran.
+  A workflow none of whose reruns was read is still priced at a whole run, and the evidence
+  names it; the finding is then inferred rather than measured.
+- **the same commit runs twice** fell back to the workflow's mean run whenever the newest
+  successful runs held no run of a duplicated commit, which on a busy repository is a matter of
+  timing. Now older successful runs of such commits are timed for the rule until there are two
+  of each kind, so the cheaper of the two runs prices the duplicate whenever the window holds a
+  successful run of each kind from such a commit.
 
 Setups a self-hosted host already carries, and logs nobody reads. Found by hand on a self-hosted
 repository on 2026-11-08 (an 80 s job with a 471 KB log, cut to 17 s and 41 KB), now rules:
@@ -29,6 +69,28 @@ are silent:
   that name holds exactly that one file. Two new endpoints, the run's artifact listing and the
   artifact's zip redirect, read only where the file raises a candidate; the zip is read for the
   names in its directory and never opened. `collect` takes `artifacts: false` to skip it.
+
+Fixed:
+
+- **the same commit runs twice** prices a duplicate at the cheaper of its two runs, measured on
+  the commits that ran on both events, instead of at the workflow's mean run. A pull request run
+  that skips the tests for a branch of the repository (a job-level `if:`) costs a fraction of the
+  mean, and a pull request from a fork, which has no push run, no longer prices it. On a large
+  public repository audited on 2026-11-20 the figure fell from about 466 job-minutes a week to the
+  103 its one duplicated job really costs.
+- **job token wider than the job** reads the reusable workflow a job calls: a call whose file
+  gives every job narrowed permissions (the job's own block, or else the file's default, never
+  `write-all`) is no longer called unscoped, and the evidence names
+  the jobs rather than the whole file. Before, a local call to a file that sets `contents: read`
+  was reported as handing out the default token.
+- **no code scanning** reads the reusable workflows a job calls, in this repository or another
+  (at the called ref, up to 12 files): CodeQL run through a shared workflow of another repository
+  now counts, and a called file that could not be read, or a call that cannot be resolved, leaves
+  the finding out instead of claiming there is no scanner.
+- **required checks no pull request reports** reads the newest successful pull request run. The
+  newest completed one could be cancelled, waiting for a maintainer's approval or failed, and stop
+  before a matrix whose names the required checks match: such a run is no longer taken as the
+  checks pull requests get.
 
 ## 0.3.0
 
